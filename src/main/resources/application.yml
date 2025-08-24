@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: "HttpWebClientService"
+eureka:
+  client:
+    service-url:
+      defaultZone: "http://localhost:8761/eureka"
+    register-with-eureka: true     # register as HttpWebClientService
+    fetch-registry: true           # fetch registry to enable load-balancing
+
+
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# This is your custom namespace. You could name it anything (e.g. "client:",
+# "remote-api:", "user-service:", etc.). Here we chose "dservice:" to remind us
+# that this is the base URL for our “dservice” backend, but we don't user it anymore.
+# Now we added also service-id:backend-service , because we will use Eureka to resolve by service-id, which is 'backend-service'.
+dservice:
+  #base-url: http://localhost:8081 - hard coded URL is no longer needed, because we will use Eureka and resolve by service-id:
+  service-id: "backend-service"
+  use-eureka: true
+
+#  dservice: is not special to Spring. It’s simply a grouping key (a map) under which you put your settings.
+#  Under dservice:, you create a property called base-url whose value is http://localhost:8081.
+#  Later, your code will read user.base-url instead of having builder.baseUrl("http://localhost:8081") hard-coded.
+
+
+

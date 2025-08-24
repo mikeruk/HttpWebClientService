@@ -1,0 +1,37 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.0'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'reactive'
+version = '0.0.1-SNAPSHOT'
+sourceCompatibility = '17'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation group: 'jakarta.validation', name: 'jakarta.validation-api', version: '3.1.1'
+    implementation platform("org.springframework.cloud:spring-cloud-dependencies:2024.0.1")
+    implementation "org.springframework.cloud:spring-cloud-starter-netflix-eureka-client"
+
+    //for implementing 1. Adjusting Timeouts (Connect, Read, Write)
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+
+    // for implementing Custom Load-Balancing rules for  8. Custom Load-Balancing Rules (Zone/Affinity, Metadata-based Routing)
+    // https://mvnrepository.com/artifact/org.springframework.cloud/spring-cloud-starter-loadbalancer
+    implementation group: 'org.springframework.cloud', name: 'spring-cloud-starter-loadbalancer', version: '4.3.0'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
