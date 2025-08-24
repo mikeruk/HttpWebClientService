@@ -9,6 +9,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactive.httpwebclientservice.HttpClientInterface;
+import reactive.httpwebclientservice.filters.AuthHeaderFilter;
+import reactive.httpwebclientservice.filters.CorrelationHeaderFilter;
 import reactive.httpwebclientservice.filters.RetryBackoffFilter;
 import reactor.netty.http.client.HttpClient;
 
@@ -64,9 +66,18 @@ public class ApplicationBeanConfiguration {
                         0.0                      // no jitter (deterministic)
                 );
 
+        CorrelationHeaderFilter correlationFilter = new CorrelationHeaderFilter();
+
+        AuthHeaderFilter authFilter = new AuthHeaderFilter(props::getAuthToken);
+
         return WebClient.builder()
                 .clientConnector(connector)
-                .filters(list -> list.add(retryFilter));
+                .filters(list -> {
+                    // request-mutating filters should run BEFORE retry (so each retry has headers)
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+                    list.add(retryFilter);
+                });
     }
 
     @Bean

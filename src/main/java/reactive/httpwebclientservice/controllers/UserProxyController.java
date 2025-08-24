@@ -12,6 +12,8 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
+import static reactive.httpwebclientservice.utils.Correlation.*;
+
 
 @RestController
 @RequestMapping("/proxy")       // <— choose any prefix you like
@@ -84,6 +86,19 @@ public class UserProxyController {
         //That 'return value' is the contract you make with WebFlux. The incoming request has a Netty channel and
         //that 'return value' is what ties that channel to your reactive pipeline.
         return users.ping();                       // non-blocking
+    }
+
+
+    @GetMapping("/user-with-headers/{id}")
+    public Mono<ResponseEntity<UserDTO>> getByIdWithHeaders(
+            @PathVariable Long id,
+            @RequestHeader(value = "X-API-Version", required = false) String ver,
+            @RequestHeader(value = HEADER, required = false) String incomingCorrId) {
+
+        String corrId = (incomingCorrId == null || incomingCorrId.isBlank()) ? newId() : incomingCorrId;
+
+        return users.getById(id, ver)
+                .contextWrite(ctx -> ctx.put(CTX_KEY, corrId)); // ← seed once; filter reads it
     }
 
 

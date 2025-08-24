@@ -1156,22 +1156,270 @@ filter above is the clearest, least magic approach.
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
+               START of experiment to customize the RestClient -  3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
 
 3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
    In a microservice world, you often want to propagate a “correlation ID” (for tracing across services) or inject an
    Authorization: Bearer <token> header automatically on every request.
+
+Our goal will be - when the webclient sends out a request towards the backend service, the request will be injected with
+a custom header and value. To achieve this, we first write the header values into a context relative to the webclient.
+Then, the webclient utilizes a Filter. Inside that filter the custom header is extracted from the context and added 
+to the outgoing request. Below is the code implementation of this workflow.
+
+You can inject headers in two complementary ways:
+1. Globally (every request) via the WebClient.Builder
+2. Per inbound request by seeding a correlation ID into the Reactor Context and letting a filter read it
+
+Below is a clean, code-only setup (no application.yml) that does both.
+
+A. Correlation ID: propagate per inbound request
+1) A tiny helper with constants
+
+```java
+// Correlation.java
+package reactive.httpwebclientservice.headers;
+
+import java.util.UUID;
+
+public final class Correlation {
+    private Correlation() {}
+
+    public static final String HEADER = "X-Correlation-Id";
+    public static final String CTX_KEY = "corrId";
+
+    public static String newId() { return UUID.randomUUID().toString(); }
+}
+
+
+```
+
+2) A WebClient filter that adds the header from Reactor Context (or generates one)
+
+```java
+// CorrelationHeaderFilter.java
+package reactive.httpwebclientservice.headers;
+
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Mono;
+
+public class CorrelationHeaderFilter implements ExchangeFilterFunction {
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        return Mono.deferContextual(ctxView -> {
+            String corrId = ctxView.hasKey(Correlation.CTX_KEY)
+                    ? ctxView.get(Correlation.CTX_KEY)
+                    : Correlation.newId(); // fallback if controller forgot to seed
+
+            System.out.println("CorrelationFilter setting header: " + corrId); // Debug
+
+            ClientRequest mutated = ClientRequest.from(request)
+                    .headers(h -> h.set(Correlation.HEADER, corrId))
+                    .build();
+
+            return next.exchange(mutated);
+        });
+    }
+}
+
+
+```
+
+3) Seed the Reactor Context in your controller (one line per handler)
+```java
+
+// UserProxyController.java (snippet)
+import static reactive.httpwebclientservice.headers.Correlation.*;
+
+@GetMapping("/user-tih-headers/{id}")
+public Mono<ResponseEntity<UserDTO>> getByIdWithHeaders(
+        @PathVariable Long id,
+        @RequestHeader(value = "X-API-Version", required = false) String ver,
+        @RequestHeader(value = HEADER, required = false) String incomingCorrId) {
+
+    String corrId = (incomingCorrId == null || incomingCorrId.isBlank()) ? newId() : incomingCorrId;
+
+    return users.getById(id, ver)
+            .contextWrite(ctx -> ctx.put(CTX_KEY, corrId)); // ← seed once; filter reads it
+}
+
+```
+
+Why context? Because reactive code hops threads; using ThreadLocal/MDC won’t reliably flow to the WebClient. 
+The Reactor Context is the right place to carry per-request metadata.
+
+B. Authorization header: static token or pluggable supplier
+```java
+// AuthHeaderFilter.java
+package reactive.httpwebclientservice.headers;
+
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Mono;
+
+import java.util.function.Supplier;
+
+public class AuthHeaderFilter implements ExchangeFilterFunction {
+
+    private final Supplier<String> tokenSupplier;
+
+    public AuthHeaderFilter(Supplier<String> tokenSupplier) {
+        this.tokenSupplier = tokenSupplier;
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        String token = tokenSupplier.get(); // can call OAuth provider here if you later swap suppliers
+        ClientRequest mutated = ClientRequest.from(request)
+                .headers(h -> {
+                    if (token != null && !token.isBlank()) {
+                        h.setBearerAuth(token);
+                    }
+                })
+                .build();
+        return next.exchange(mutated);
+    }
+}
+
+```
+and add the authToken  authToken: "superSecretToken" to the application.yml:
+```yml
+dservice:
+  service-id: "backend-service"
+  use-eureka: true
+  authToken: "superSecretToken"
+
+```
+C. Wire both filters into your existing builder (order matters)
+
+```java
+/**
+     * A builder that applies the LoadBalancerExchangeFilterFunction
+     * so URIs like http://backend-service are resolved via Eureka.
+     */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+
+        // Attach the retry filter here so every client built from this builder gets it.
+        RetryBackoffFilter retryFilter =
+                new RetryBackoffFilter(
+                        2,                       // <- 2 retries (total 3 tries)
+                        Duration.ofSeconds(1),   // first backoff
+                        Duration.ofSeconds(1),   // cap
+                        0.0                      // no jitter (deterministic)
+                );
+
+        CorrelationHeaderFilter correlationFilter = new CorrelationHeaderFilter();
+
+        AuthHeaderFilter authFilter = new AuthHeaderFilter(props::getAuthToken);
+
+        return WebClient.builder()
+                .clientConnector(connector)
+                .filters(list -> {
+                    // request-mutating filters should run BEFORE retry (so each retry has headers)
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+                    list.add(retryFilter);
+                });
+    }
+
+```
+Putting correlation/auth before the retry filter ensures every retry attempt carries the same headers 
+(including the correlation ID), and if you rotate tokens per call, retries see the latest token.
+
+D. How to test
+Send a postman request to: http://localhost:8080/proxy/user-with-headers/2
+Add a header:
+X-Correlation-Id = abc-123      - this is the header we are interested for our experiment
+
+Optional, add another header, just because the backend service can receive it too:
+X-API-Version = someVersion1
+
+What should we expect to happen: When the controller receives the header X-Correlation-Id = abc-123 ,
+it will check is here:
+```java
+String corrId = (incomingCorrId == null || incomingCorrId.isBlank()) ? newId() : incomingCorrId;
+```
+and will set its value 'corrId' in the filter via the context, so:
+```java
+return users.getById(id, ver)
+                .contextWrite(ctx -> ctx.put(CTX_KEY, corrId)); // ← seed once; filter reads it
+```
+
+Next the Filter 'public class CorrelationHeaderFilter implements ExchangeFilterFunction '
+will execute its method and will also print the debug line:
+```java
+System.out.println("CorrelationFilter setting header: " + corrId); // Debug
+```
+ and we see this line printed on the console:
+```text
+CorrelationFilter setting header: abc-123
+
+```
+And we expect that this header is now successfully added to the request which goues out to the backend service.
+
+In the backend-service the controller receives that request, so:
+```java
+@GetMapping("/user/{id}")
+    public ResponseEntity<EntityModel<User>> getUserById(@PathVariable Long id,
+                                                         @RequestHeader(value = "X-API-Version", required = false) String apiVersion,
+                                                         @RequestHeader(value = "X-Correlation-Id", required = false) String xCorrelationId) throws JsonProcessingException {
+
+        System.out.println(">>>> Received X-API-Version: " + apiVersion);
+        System.out.println(">>>> X-Correlation-Id: " + xCorrelationId);
+        User user = userService.selectUserByPrimaryKey(id).orElse(null);
+```
+
+and indees prints the headers on the console:
+```text
+>>>> Received X-API-Version: v1
+>>>> X-Correlation-Id: 00c18abc-b581-45cd-ba78-8f0c126183b3
+```
+
+, BUT if case we dont excplicitly set such header via the Postman client:
+```text
+X-Correlation-Id = abc-123      - this is the header we are interested for our experiment
+```
+then our code will assign a random value for that header, so:
+```java
+String corrId = (incomingCorrId == null || incomingCorrId.isBlank()) ? newId() : incomingCorrId;
+```
+the method newId() will generate a random value and next that value will be set as a header and
+the Filter 'public class CorrelationHeaderFilter implements ExchangeFilterFunction ' 
+will execute its method and will also print the debug line:
+```java
+System.out.println("CorrelationFilter setting header: " + corrId); // Debug
+```
+and we see this line printed on the console:
+```text
+CorrelationFilter setting header: 9ac5d91b-5912-47d8-9e8f-67e71fed48e6
+```
+
+, logically the backend service will also receive that value and will print it so:
+```text
+>>>> Received X-API-Version: v1
+>>>> X-Correlation-Id: 00c18abc-b581-45cd-ba78-8f0c126183b3
+```
+
+
+This is how we tested our new functionality.
+
+
+
+
+
+               END of experiment to customize the RestClient -  3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
+
+
+
+
+
+
 
 4. Custom Error Decoding & Mapping to Exceptions
    By default, non‐2xx responses are turned into a generic RestClientResponseException. You might want to map, say, a 404 to a

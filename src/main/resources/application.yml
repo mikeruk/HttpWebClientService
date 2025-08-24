@@ -20,6 +20,7 @@ dservice:
   #base-url: http://localhost:8081 - hard coded URL is no longer needed, because we will use Eureka and resolve by service-id:
   service-id: "backend-service"
   use-eureka: true
+  authToken: "superSecretToken"
 
 #  dservice: is not special to Spring. It’s simply a grouping key (a map) under which you put your settings.
 #  Under dservice:, you create a property called base-url whose value is http://localhost:8081.
