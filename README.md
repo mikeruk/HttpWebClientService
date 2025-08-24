@@ -1,10 +1,12 @@
 
 
-                                    My custom WebClient Docs
+                                    My custom WebClient -  Docs
 
     https://docs.spring.io/spring-framework/reference/integration/rest-clients.html#rest-webclient
 
     https://docs.spring.io/spring-framework/reference/web/webflux-webclient/client-builder.html
+
+    https://docs.spring.io/spring-framework/reference/web/webflux-webclient.html    
 
 
 
@@ -806,6 +808,349 @@ That’s it—pure builder-based configuration
 
 
 
+               START of experiment to customize the RestClient -  2. Adding a Retry/Backoff Strategy
+
+
+Great next step. For retries/backoff you’ve got two solid options:
+1. “Pure Reactor” (lightweight, zero extra deps) — use reactor.util.retry.Retry with a WebClient filter.
+2. Resilience4j via Spring Cloud CircuitBreaker — more features (metrics, bulkhead, CB), a bit heavier.
+
+Since we want to learn about tweaking the builder, here’s the 1. “Pure Reactor” way described.
+
+1) Add a retry/backoff filter (code-only)
+   Create this class: public class RetryBackoffFilter implements ExchangeFilterFunction
+```java
+package reactive.httpwebclientservice.filters;
+
+import io.netty.handler.timeout.ReadTimeoutException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.web.reactive.function.client.ClientRequest;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
+import org.springframework.web.reactive.function.client.ExchangeFunction;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+import reactor.util.retry.RetryBackoffSpec;
+
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.time.Duration;
+import java.util.Set;
+import java.util.concurrent.TimeoutException;
+
+public class RetryBackoffFilter implements ExchangeFilterFunction {
+
+    private static final Logger log = LoggerFactory.getLogger(RetryBackoffFilter.class);
+
+    private final int maxAttempts;
+    private final Duration minBackoff;
+    private final Duration maxBackoff;
+    private final double jitter;
+
+    private static final Set<Integer> RETRYABLE_STATUS =
+            Set.of(500, 502, 503, 504, 429);
+
+    public RetryBackoffFilter(int maxAttempts, Duration minBackoff, Duration maxBackoff, double jitter) {
+        this.maxAttempts = maxAttempts;
+        this.minBackoff = minBackoff;
+        this.maxBackoff = maxBackoff;
+        this.jitter = jitter;
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        return next.exchange(request)
+                .flatMap(response -> {
+                    // Convert retryable HTTP statuses into an error to trigger retryWhen.
+                    if (shouldRetryForStatus(request, response)) {
+                        // Important: drain/release the body so the connection can be reused.
+                        return response.releaseBody()
+                                .then(Mono.error(new RetryableStatusException(
+                                        response.statusCode(), request.method(), request.url().toString())));
+                    }
+                    return Mono.just(response);
+                })
+                .retryWhen(buildRetrySpec(request));
+    }
+
+    private Retry buildRetrySpec(ClientRequest request) {
+        final boolean idempotent = isIdempotent(request);
+
+        // If not idempotent, do not retry (maxAttempts=1 effectively).
+        int attempts = idempotent ? maxAttempts : 1;
+
+        RetryBackoffSpec spec = Retry.backoff(attempts, minBackoff)
+                .maxBackoff(maxBackoff)
+                .jitter(jitter)
+                .filter(this::isRetryableError)
+                .onRetryExhaustedThrow((signal, failure) -> failure.failure());
+
+        return spec.doBeforeRetry(rs ->
+                log.warn("Retrying {} {} (attempt #{}, cause: {})",
+                        request.method(), request.url(), rs.totalRetries() + 1, rs.failure().toString()));
+    }
+
+    private boolean shouldRetryForStatus(ClientRequest req, ClientResponse resp) {
+        return isIdempotent(req) && RETRYABLE_STATUS.contains(resp.statusCode().value());
+    }
+
+    private boolean isIdempotent(ClientRequest req) {
+        HttpMethod m = req.method();
+        // RFC says DELETE and PUT are idempotent; keep them here. POST allowed only if caller set Idempotency-Key.
+        if (m == HttpMethod.GET || m == HttpMethod.HEAD || m == HttpMethod.OPTIONS
+                || m == HttpMethod.DELETE || m == HttpMethod.PUT) {
+            return true;
+        }
+        if (m == HttpMethod.POST && req.headers().containsKey("Idempotency-Key")) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isRetryableError(Throwable t) {
+        // Transport-level / transient failures
+        if (t instanceof WebClientRequestException wcre) {
+            Throwable cause = wcre.getCause();
+            return cause instanceof ConnectException
+                    || cause instanceof ReadTimeoutException
+                    || cause instanceof TimeoutException
+                    || cause instanceof UnknownHostException
+                    || cause instanceof SocketException
+                    || cause instanceof IOException;
+        }
+        // Our synthesized error for 5xx/429
+        if (t instanceof RetryableStatusException) return true;
+
+        // Bare TimeoutException (e.g., from .timeout())
+        return t instanceof TimeoutException;
+    }
+
+    /** Marker exception to represent retryable HTTP status codes. */
+    static class RetryableStatusException extends RuntimeException {
+        private final HttpStatusCode status;
+        private final HttpMethod method;
+        private final String url;
+
+        RetryableStatusException(HttpStatusCode status, HttpMethod method, String url) {
+            super("Retryable HTTP status " + status + " for " + method + " " + url);
+            this.status = status; this.method = method; this.url = url;
+        }
+
+        public HttpStatusCode getStatus() { return status; }
+        public HttpMethod getMethod() { return method; }
+        public String getUrl() { return url; }
+    }
+}
+
+```
+Defaults used in the example
+maxAttempts = 3 (original try + 2 retries)
+minBackoff = 200ms, maxBackoff = 2s
+jitter = 0.5 (±50% randomness)
+
+You can tune those in a single place.
+
+2) Register the filter on your load-balanced builder. The ApplicationBeanConfiguration is now this:
+```java
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    private final DserviceClientProperties props;
+
+    // Constructor injection of our properties holder
+    public ApplicationBeanConfiguration(DserviceClientProperties props) {
+        this.props = props;
+    }
+
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean
+    ReactorClientHttpConnector clientHttpConnector() {
+        HttpClient http = HttpClient.create()
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+
+                // RESPONSE timeout (time from request write until first response byte/headers)
+                .responseTimeout(Duration.ofSeconds(100))
+
+                // READ/WRITE inactivity timeouts (no bytes read/written for N seconds)
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
+                        .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
+                );
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+    /**
+     * A builder that applies the LoadBalancerExchangeFilterFunction
+     * so URIs like http://backend-service are resolved via Eureka.
+     */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+
+        // Attach the retry filter here so every client built from this builder gets it.
+        RetryBackoffFilter retryFilter =
+                new RetryBackoffFilter(
+                        2,                       // <- 2 retries (total 3 tries)
+                        Duration.ofSeconds(1),   // first backoff
+                        Duration.ofSeconds(1),   // cap
+                        0.0                      // no jitter (deterministic)
+                );
+
+        return WebClient.builder()
+                .clientConnector(connector)
+                .filters(list -> list.add(retryFilter));
+    }
+
+    @Bean
+    public HttpClientInterface userHttpInterface(WebClient.Builder builder) {
+        String host = "http://" + props.getServiceId();  // e.g. http://backend-service
+        WebClient webClient = builder
+                .baseUrl(host)
+                .build();
+
+        return org.springframework.web.service.invoker.HttpServiceProxyFactory
+                .builderFor(org.springframework.web.reactive.function.client.support.WebClientAdapter.create(webClient))
+                .build()
+                .createClient(HttpClientInterface.class);
+    }
+}
+```
+Because we add our filter to the builder, the retry is global (applies to your HttpClientInterface calls). 
+If you later need different retry rules for certain endpoints, you can builder.clone() and attach a different 
+filter for those clients only.
+
+
+At this point the retry must work. Make the backend-service to throw some exception 
+like that throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Service temporarily unavailable");
+upon calling the controller. Then here the webclient will print our RetryException on the console:
+
+This error will be printed only after the last failed retry. So, you will not see it 3 times if you have set 3 times to retry.
+
+```text
+2025-08-24T13:10:28.846+02:00 ERROR 47040 --- [HttpWebClientService] [nio-8080-exec-3] o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] threw exception
+
+reactive.httpwebclientservice.filters.RetryBackoffFilter$RetryableStatusException: Retryable HTTP status 503 SERVICE_UNAVAILABLE for GET http://backend-service/api/v1/user/2
+	at reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:53) ~[main/:na]
+	Suppressed: reactor.core.publisher.FluxOnAssembly$OnAssemblyException: 
+Assembly trace from producer [reactor.core.publisher.MonoIgnoreThen] :
+	reactor.core.publisher.Mono.then(Mono.java:4879)
+	reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:52)
+Error has been observed at the following site(s):
+	*_____________Mono.then ⇢ at reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:52)
+	*__________Mono.flatMap ⇢ at reactive.httpwebclientservice.filters.RetryBackoffFilter.filter(RetryBackoffFilter.java:47)
+	|_       Mono.retryWhen ⇢ at reactive.httpwebclientservice.filters.RetryBackoffFilter.filter(RetryBackoffFilter.java:57)
+	*________Flux.concatMap ⇢ at reactor.util.retry.RetryBackoffSpec.lambda$generateCompanion$5(RetryBackoffSpec.java:593)
+	|_     Flux.onErrorStop ⇢ at reactor.util.retry.RetryBackoffSpec.lambda$generateCompanion$5(RetryBackoffSpec.java:656)
+	*__Flux.deferContextual ⇢ at reactor.util.retry.RetryBackoffSpec.generateCompanion(RetryBackoffSpec.java:591)
+	*____________Mono.defer ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:468)
+	|_           checkpoint ⇢ Request to GET http://backend-service/api/v1/user/2 [DefaultWebClient]
+	|_   Mono.switchIfEmpty ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:473)
+	|_        Mono.doOnNext ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:479)
+	|_       Mono.doOnError ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:480)
+	|_       Mono.doFinally ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:481)
+	|_    Mono.contextWrite ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:488)
+	*__Mono.deferContextual ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.exchange(DefaultWebClient.java:452)
+	|_         Mono.flatMap ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultResponseSpec.toEntity(DefaultWebClient.java:616)
+Original Stack Trace:
+		at reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:53) ~[main/:na]
+		
+
+2025-08-24T13:10:28.853+02:00 ERROR 47040 --- [HttpWebClientService] [nio-8080-exec-3] o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: reactive.httpwebclientservice.filters.RetryBackoffFilter$RetryableStatusException: Retryable HTTP status 503 SERVICE_UNAVAILABLE for GET http://backend-service/api/v1/user/2] with root cause
+
+reactive.httpwebclientservice.filters.RetryBackoffFilter$RetryableStatusException: Retryable HTTP status 503 SERVICE_UNAVAILABLE for GET http://backend-service/api/v1/user/2
+	at reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:53) ~[main/:na]
+	Suppressed: reactor.core.publisher.FluxOnAssembly$OnAssemblyException: 
+Assembly trace from producer [reactor.core.publisher.MonoIgnoreThen] :
+	reactor.core.publisher.Mono.then(Mono.java:4879)
+	reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:52)
+Error has been observed at the following site(s):
+	*_____________Mono.then ⇢ at reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:52)
+	*__________Mono.flatMap ⇢ at reactive.httpwebclientservice.filters.RetryBackoffFilter.filter(RetryBackoffFilter.java:47)
+	|_       Mono.retryWhen ⇢ at reactive.httpwebclientservice.filters.RetryBackoffFilter.filter(RetryBackoffFilter.java:57)
+	*________Flux.concatMap ⇢ at reactor.util.retry.RetryBackoffSpec.lambda$generateCompanion$5(RetryBackoffSpec.java:593)
+	|_     Flux.onErrorStop ⇢ at reactor.util.retry.RetryBackoffSpec.lambda$generateCompanion$5(RetryBackoffSpec.java:656)
+	*__Flux.deferContextual ⇢ at reactor.util.retry.RetryBackoffSpec.generateCompanion(RetryBackoffSpec.java:591)
+	*____________Mono.defer ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:468)
+	|_           checkpoint ⇢ Request to GET http://backend-service/api/v1/user/2 [DefaultWebClient]
+	|_   Mono.switchIfEmpty ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:473)
+	|_        Mono.doOnNext ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:479)
+	|_       Mono.doOnError ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:480)
+	|_       Mono.doFinally ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:481)
+	|_    Mono.contextWrite ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.lambda$exchange$12(DefaultWebClient.java:488)
+	*__Mono.deferContextual ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultRequestBodyUriSpec.exchange(DefaultWebClient.java:452)
+	|_         Mono.flatMap ⇢ at org.springframework.web.reactive.function.client.DefaultWebClient$DefaultResponseSpec.toEntity(DefaultWebClient.java:616)
+Original Stack Trace:
+		at reactive.httpwebclientservice.filters.RetryBackoffFilter.lambda$filter$0(RetryBackoffFilter.java:53) ~[main/:na]
+		at reactor.core.publisher.MonoFlatMap$FlatMapMain.onNext(MonoFlatMap.java:132) ~[reactor-core-3.7.6.jar:3.7.6]
+		at reactor.core.publisher.MonoFlatMap$FlatMapMain.secondComplete(MonoFlatMap.java:245) ~[reactor-core-3.7.6.jar:3.7.6]
+	
+
+Disconnected from the target VM, address: '127.0.0.1:35901', transport: 'socket'
+```
+That's it, it works!
+
+You will notice that the filer has this method:
+
+```java
+private boolean isIdempotent(ClientRequest req) {
+        HttpMethod m = req.method();
+        // RFC says DELETE and PUT are idempotent; keep them here. POST allowed only if caller set Idempotency-Key.
+        if (m == HttpMethod.GET || m == HttpMethod.HEAD || m == HttpMethod.OPTIONS
+                || m == HttpMethod.DELETE || m == HttpMethod.PUT) {
+            return true;
+        }
+        if (m == HttpMethod.POST && req.headers().containsKey("Idempotency-Key")) {
+            return true;
+        }
+        return false;
+    }
+
+```
+Why is it waht it does? 
+By default all POST requests in the WebClient do not apply the retry functionality as defined above.
+BUT you can still make a certain POST request to be executed with Retries! The filter will be checking for POST
+request with Header:.header("Idempotency-Key", "user:42") , but you also have to customize that particular request, 
+like so:
+This peice of code is not implemented, because I dont have any POST Requset going out from that WebClient. For that reason
+the filer currently implements that if (m == HttpMethod.POST && req.headers().containsKey("Idempotency-Key"))  in vain - it better be removed.
+But if you decide to use that check, then make sure your webclient also adds such headers to POST requests.
+```java
+// In your controller, for a POST that *is* safe to retry:
+return WebClient.create("http://backend-service")
+        .post()
+        .uri("/api/v1/create-new-user")
+        .header("Idempotency-Key", "user:42") // tells the filter it’s safe to retry
+        .bodyValue(body)
+        .retrieve()
+        .toEntity(UserDbDTO.class);
+
+```
+
+
+So far we implemented the Retry Backoff strategy on the webclient level with a Filter.
+
+The alternative of that strategy is the:
+5) When to consider Resilience4j - this is not implemented in this project. Here is just general information:
+You want metrics (attempts, successes, failures), bulkhead, circuit-breaker, or rate limiting.
+You need policies per endpoint name rather than per HTTP method.
+You’d wrap the Mono with RetryOperator.of(retry) from Resilience4j, but for learning the basics, the Reactor
+filter above is the clearest, least magic approach.
+
+
+
+               END of experiment to customize the RestClient -  2. Adding a Retry/Backoff Strategy
 
 
 
@@ -823,17 +1168,6 @@ That’s it—pure builder-based configuration
 
 
 
-
-
-
-
-
-
-
-
-2. Adding a Retry/Backoff Strategy
-   Networks can be flaky. If your backend occasionally returns 5xx or times out, you might want to automatically retry a few times
-   before giving up (with exponential backoff).
 
 3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
    In a microservice world, you often want to propagate a “correlation ID” (for tracing across services) or inject an

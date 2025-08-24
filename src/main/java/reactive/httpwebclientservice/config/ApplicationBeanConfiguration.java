@@ -9,6 +9,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactive.httpwebclientservice.HttpClientInterface;
+import reactive.httpwebclientservice.filters.RetryBackoffFilter;
 import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
@@ -53,8 +54,19 @@ public class ApplicationBeanConfiguration {
     @Bean
     @LoadBalanced
     public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+
+        // Attach the retry filter here so every client built from this builder gets it.
+        RetryBackoffFilter retryFilter =
+                new RetryBackoffFilter(
+                        2,                       // <- 2 retries (total 3 tries)
+                        Duration.ofSeconds(1),   // first backoff
+                        Duration.ofSeconds(1),   // cap
+                        0.0                      // no jitter (deterministic)
+                );
+
         return WebClient.builder()
-                .clientConnector(connector);
+                .clientConnector(connector)
+                .filters(list -> list.add(retryFilter));
     }
 
     @Bean
