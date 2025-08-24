@@ -1,5 +1,6 @@
 package reactive.httpwebclientservice.controllers;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import reactive.httpwebclientservice.DTOs.db.UserDTO;
@@ -7,7 +8,9 @@ import reactive.httpwebclientservice.DTOs.db.UserDbDTO;
 import reactive.httpwebclientservice.HttpClientInterface;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
 
 @RestController
@@ -41,6 +44,14 @@ public class UserProxyController {
         //That 'return value' is the contract you make with WebFlux. The incoming request has a Netty channel and
         //that 'return value' is what ties that channel to your reactive pipeline.
         return users.getById(id, ver);             // non-blocking
+    }
+
+    @GetMapping("/user-fast/{id}")
+    public Mono<ResponseEntity<UserDTO>> getByIdFast(@PathVariable Long id) {
+        return users.getById(id, null)
+                .timeout(Duration.ofSeconds(2)) // stricter for this call only
+                .onErrorResume(TimeoutException.class,
+                        ex -> Mono.just(ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT).build()));
     }
 
     @GetMapping("/user-with-data/{id}")

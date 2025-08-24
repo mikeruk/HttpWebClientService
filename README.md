@@ -662,12 +662,174 @@ Postman, the browser, or any client at all.
 
                START of experiment to customize the RestClient -  1. Adjusting Timeouts (Connect, Read, Write)
 
-
-
-
 1. Adjusting Timeouts (Connect, Read, Write)
    By default, the underlying HTTP client (used by Spring’s RestClient) may have timeouts that are too long (or too short) for your
    environment. If you expect slow endpoints or want to fail fast, customizing connect/read/write timeouts is critical.
+
+        NB !!!! Few important remarks:
+First thing to notice! Setting a timeout on the  Reactor Netty client level like so:  .addHandlerLast(new ReadTimeoutHandler(10)),
+really has effect and applies this timeout. I can set up it up to 30 sec and it still throws my exceptions:
+```text
+HttpWebClientService] [nio-8080-exec-3] o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] threw exception
+io.netty.handler.timeout.ReadTimeoutException: null
+```
+, BUT the moment I increase the value to 31 or even 100 - it is not applied any more. Some underlying layer kicks in
+with its default timeout and throws its own exception and the postman client also receives the response:
+```text
+[HttpWebClientService] [nio-8080-exec-3] .w.s.m.s.DefaultHandlerExceptionResolver : Resolved [org.springframework.web.context.request.async.AsyncRequestTimeoutException]
+```
+What causes this? Answer is:
+It’s the server-side async request timeout from Spring MVC/Tomcat, which kicks in and aborts the request with:
+```text
+Resolved [org.springframework.web.context.request.async.AsyncRequestTimeoutException]
+```
+The project is built with dependency of 'implementation 'org.springframework.boot:spring-boot-starter-web'.
+So if you need a pure WebClient and Reactor Netty server, consider removing that spring-boot-starter-web
+dependency.
+
+Next, here is how to implement Timeouts (Connect, Read, Write)
+
+First, 1) Set global timeouts on the WebClient (via Reactor Netty), 
+Update the ApplicationBeanConfiguration class to be so:
+
+```java
+package reactive.httpwebclientservice.config;
+
+import io.netty.channel.ChannelOption;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import org.springframework.cloud.client.loadbalancer.LoadBalanced;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactive.httpwebclientservice.HttpClientInterface;
+import reactor.netty.http.client.HttpClient;
+
+import java.time.Duration;
+
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    private final DserviceClientProperties props;
+
+    // Constructor injection of our properties holder
+    public ApplicationBeanConfiguration(DserviceClientProperties props) {
+        this.props = props;
+    }
+
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean
+    ReactorClientHttpConnector clientHttpConnector() {
+        HttpClient http = HttpClient.create()
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+
+                // RESPONSE timeout (time from request write until first response byte/headers)
+                .responseTimeout(Duration.ofSeconds(100))
+
+                // READ/WRITE inactivity timeouts (no bytes read/written for N seconds)
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
+                        .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
+                );
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+    /**
+     * A builder that applies the LoadBalancerExchangeFilterFunction
+     * so URIs like http://backend-service are resolved via Eureka.
+     */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+        return WebClient.builder()
+                .clientConnector(connector);
+    }
+
+    @Bean
+    public HttpClientInterface userHttpInterface(WebClient.Builder builder) {
+        String host = "http://" + props.getServiceId();  // e.g. http://backend-service
+        WebClient webClient = builder
+                .baseUrl(host)
+                .build();
+
+        return org.springframework.web.service.invoker.HttpServiceProxyFactory
+                .builderFor(org.springframework.web.reactive.function.client.support.WebClientAdapter.create(webClient))
+                .build()
+                .createClient(HttpClientInterface.class);
+    }
+}
+
+```
+What each timeout does
+- Connect timeout: fail fast if the TCP connection can’t be established in time.
+- Response timeout: fail if the server doesn’t send the first response byte/headers within the window.
+- Read/Write timeouts: fail if there’s no IO activity on the socket for the given seconds (good for stalled/slow connections and large uploads).
+These are transport-level timeouts—set once on the connector and they apply to every call made through this WebClient.
+
+
+2) (Optional) Per-call overrides right in the controller
+Sometimes you want a stricter timeout only for a specific endpoint. 
+Then add the timeout on the method level for the specific request:
+```java
+import reactor.core.publisher.Mono;
+import java.time.Duration;
+import java.util.concurrent.TimeoutException;
+import org.springframework.http.HttpStatus;
+
+@GetMapping("/user-fast/{id}")
+    public Mono<ResponseEntity<UserDTO>> getByIdFast(@PathVariable Long id) {
+        return users.getById(id, null)
+                .timeout(Duration.ofSeconds(2)) // stricter for this call only
+                .onErrorResume(TimeoutException.class,
+                        ex -> Mono.just(ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT).build()));
+    }
+```
+3) Tips you’ll appreciate later
+Response vs. read timeout: If the server sends headers promptly but then stalls mid-body, responseTimeout won’t help—read timeout will.
+Timeout + retry: If you add retries, make sure the timeout < server-side processing time, or you’ll start retry storms.
+Keep Eureka working: The @LoadBalanced WebClient.Builder keeps the LoadBalancer filter even when you swap connectors or clone() the builder.
+
+That’s it—pure builder-based configuration
+
+
+
+               END of experiment to customize the RestClient -  1. Adjusting Timeouts (Connect, Read, Write)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 2. Adding a Retry/Backoff Strategy
    Networks can be flaky. If your backend occasionally returns 5xx or times out, you might want to automatically retry a few times

@@ -1,12 +1,17 @@
 package reactive.httpwebclientservice.config;
 
+import io.netty.channel.ChannelOption;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
 import org.springframework.cloud.client.loadbalancer.LoadBalanced;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.reactive.function.client.support.WebClientAdapter;
-import org.springframework.web.service.invoker.HttpServiceProxyFactory;
 import reactive.httpwebclientservice.HttpClientInterface;
+import reactor.netty.http.client.HttpClient;
+
+import java.time.Duration;
 
 @Configuration
 public class ApplicationBeanConfiguration {
@@ -18,29 +23,49 @@ public class ApplicationBeanConfiguration {
         this.props = props;
     }
 
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean
+    ReactorClientHttpConnector clientHttpConnector() {
+        HttpClient http = HttpClient.create()
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+
+                // RESPONSE timeout (time from request write until first response byte/headers)
+                .responseTimeout(Duration.ofSeconds(100))
+
+                // READ/WRITE inactivity timeouts (no bytes read/written for N seconds)
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
+                        .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
+                );
+
+        return new ReactorClientHttpConnector(http);
+    }
 
     /**
      * A builder that applies the LoadBalancerExchangeFilterFunction
      * so URIs like http://backend-service are resolved via Eureka.
      */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
     @Bean
     @LoadBalanced
-    public WebClient.Builder loadBalancedWebClientBuilder() {
-        return WebClient.builder();
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+        return WebClient.builder()
+                .clientConnector(connector);
     }
 
     @Bean
-    public HttpClientInterface userHttpInterface(WebClient.Builder builder)
-    {
-        // Always point at service-ID: the load balancer will resolve it.
-        // That WebClient is fully asynchronous (none-blocking) client!
-        String host = "http://" + props.getServiceId();
+    public HttpClientInterface userHttpInterface(WebClient.Builder builder) {
+        String host = "http://" + props.getServiceId();  // e.g. http://backend-service
         WebClient webClient = builder
                 .baseUrl(host)
                 .build();
 
-        return HttpServiceProxyFactory
-                .builderFor(WebClientAdapter.create(webClient))
+        return org.springframework.web.service.invoker.HttpServiceProxyFactory
+                .builderFor(org.springframework.web.reactive.function.client.support.WebClientAdapter.create(webClient))
                 .build()
                 .createClient(HttpClientInterface.class);
     }
