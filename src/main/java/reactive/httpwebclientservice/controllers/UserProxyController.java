@@ -71,7 +71,6 @@ public class UserProxyController {
     @GetMapping("/proxy-http-status/{code}")
     public Mono<ResponseEntity<String>> getCustomErrorResponse(@PathVariable int code) {
 
-
         //Always return the Mono (or Flux).
         //That 'return value' is the contract you make with WebFlux. The incoming request has a Netty channel and
         //that 'return value' is what ties that channel to your reactive pipeline.

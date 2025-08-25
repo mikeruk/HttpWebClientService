@@ -1420,10 +1420,428 @@ This is how we tested our new functionality.
 
 
 
+               START of experiment to customize the RestClient -  4. Custom Error Decoding & Mapping to Exceptions
 
 4. Custom Error Decoding & Mapping to Exceptions
-   By default, non‐2xx responses are turned into a generic RestClientResponseException. You might want to map, say, a 404 to a
+   By default, non‐2xx responses are turned into a generic form. You might want to map, say, a 404 to a
    UserNotFoundException or a 401 to UnauthorizedException.
+
+Below I is:
+1. a small exception hierarchy,
+2. an ErrorMappingFilter that:
+- maps 4xx/5xx to your exceptions (reading the error body once, releasing the connection),
+- maps transport errors (timeouts, connect refused) and our RetryableStatusException (after retries) to domain exceptions,
+3. the builder wiring (order matters!), and
+4. an optional @ControllerAdvice so your proxy returns meaningful HTTP status codes.
+
+
+1) Exceptions (lean but useful)
+
+```java
+// errors/ApiException.java
+package reactive.httpwebclientservice.errors;
+
+public abstract class ApiException extends RuntimeException {
+    private final Integer status;
+    private final String method;
+    private final String url;
+    private final String correlationId;
+    private final String body;
+
+    protected ApiException(String message, Integer status, String method, String url, String correlationId, String body, Throwable cause) {
+        super(message, cause);
+        this.status = status;
+        this.method = method;
+        this.url = url;
+        this.correlationId = correlationId;
+        this.body = body;
+    }
+    public Integer getStatus() { return status; }
+    public String getMethod() { return method; }
+    public String getUrl() { return url; }
+    public String getCorrelationId() { return correlationId; }
+    public String getBody() { return body; }
+}
+
+```
+
+```java
+// errors/BadRequestException.java
+package reactive.httpwebclientservice.errors;
+public class BadRequestException extends ApiException {
+    public BadRequestException(String m, String method, String url, String corr, String body) {
+        super(m, 400, method, url, corr, body, null);
+    }
+}
+
+```
+```java
+// errors/UnauthorizedException.java
+package reactive.httpwebclientservice.errors;
+public class UnauthorizedException extends ApiException {
+    public UnauthorizedException(String m, String method, String url, String corr, String body) {
+        super(m, 401, method, url, corr, body, null);
+    }
+}
+
+```
+```java
+// errors/UnauthorizedException.java
+package reactive.httpwebclientservice.errors;
+public class UnauthorizedException extends ApiException {
+    public UnauthorizedException(String m, String method, String url, String corr, String body) {
+        super(m, 401, method, url, corr, body, null);
+    }
+}
+
+```
+```java
+// errors/ForbiddenException.java
+package reactive.httpwebclientservice.errors;
+public class ForbiddenException extends ApiException {
+    public ForbiddenException(String m, String method, String url, String corr, String body) {
+        super(m, 403, method, url, corr, body, null);
+    }
+}
+
+```
+
+```java
+// errors/NotFoundException.java
+package reactive.httpwebclientservice.errors;
+public class NotFoundException extends ApiException {
+    public NotFoundException(String m, String method, String url, String corr, String body) {
+        super(m, 404, method, url, corr, body, null);
+    }
+}
+
+```
+
+```java
+// errors/ConflictException.java
+package reactive.httpwebclientservice.errors;
+public class ConflictException extends ApiException {
+    public ConflictException(String m, String method, String url, String corr, String body) {
+        super(m, 409, method, url, corr, body, null);
+    }
+}
+
+```
+```java
+// errors/TooManyRequestsException.java
+package reactive.httpwebclientservice.errors;
+public class TooManyRequestsException extends ApiException {
+    private final String retryAfter;
+    public TooManyRequestsException(String m, String method, String url, String corr, String body, String retryAfter) {
+        super(m, 429, method, url, corr, body, null);
+        this.retryAfter = retryAfter;
+    }
+    public String getRetryAfter(){ return retryAfter; }
+}
+
+```
+```java
+// errors/ServiceUnavailableException.java
+package reactive.httpwebclientservice.errors;
+public class ServiceUnavailableException extends ApiException {
+    public ServiceUnavailableException(String m, String method, String url, String corr, String body, Throwable cause) {
+        super(m, 503, method, url, corr, body, cause);
+    }
+}
+
+```
+```java
+// errors/GatewayTimeoutException.java
+package reactive.httpwebclientservice.errors;
+public class GatewayTimeoutException extends ApiException {
+    public GatewayTimeoutException(String m, String method, String url, String corr, String body, Throwable cause) {
+        super(m, 504, method, url, corr, body, cause);
+    }
+}
+
+```
+
+```java
+// errors/UpstreamConnectException.java
+package reactive.httpwebclientservice.errors;
+public class UpstreamConnectException extends ApiException {
+    public UpstreamConnectException(String m, String method, String url, String corr, Throwable cause) {
+        super(m, null, method, url, corr, null, cause);
+    }
+}
+
+```
+```java
+// errors/UpstreamTimeoutException.java
+package reactive.httpwebclientservice.errors;
+public class UpstreamTimeoutException extends ApiException {
+    public UpstreamTimeoutException(String m, String method, String url, String corr, Throwable cause) {
+        super(m, null, method, url, corr, null, cause);
+    }
+}
+
+```
+
+2) The error-mapping filter
+
+```java
+// filters/ErrorMappingFilter.java
+package reactive.httpwebclientservice.filters;
+
+import io.netty.handler.timeout.ReadTimeoutException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.web.reactive.function.client.*;
+import reactive.httpwebclientservice.errors.*;
+import reactive.httpwebclientservice.utils.Correlation;
+import reactor.core.publisher.Mono;
+
+import java.net.ConnectException;
+import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.time.Duration;
+import java.util.concurrent.TimeoutException;
+
+public class ErrorMappingFilter implements ExchangeFilterFunction {
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        // Wrap the rest of the chain
+        return next.exchange(request)
+                // Map non-2xx responses to exceptions (read body once, release connection)
+                .flatMap(resp -> {
+                    if (resp.statusCode().is2xxSuccessful()) {
+                        return Mono.just(resp);
+                    }
+                    return resp.bodyToMono(String.class)
+                            .defaultIfEmpty("")
+                            .flatMap(body -> Mono.deferContextual(ctx -> {
+                                String corr = ctx.hasKey(Correlation.CTX_KEY) ? ctx.get(Correlation.CTX_KEY) : null;
+                                RuntimeException ex = mapStatusToException(resp.statusCode(), body, request, resp.headers().asHttpHeaders(), corr);
+                                return Mono.error(ex);
+                            }));
+                })
+                // Also map transport-level errors and our retry marker after retries
+                .onErrorMap(throwable -> mapTransportOrRetryErrors(throwable, request));
+    }
+
+    private RuntimeException mapStatusToException(HttpStatusCode status, String body, ClientRequest req, HttpHeaders headers, String corrId) {
+        int sc = status.value();
+        String method = req.method().name();
+        String url = req.url().toString();
+
+        // nice-to-have: Retry-After signal for 429
+        String retryAfter = headers.getFirst(HttpHeaders.RETRY_AFTER);
+
+        return switch (sc) {
+            case 400 -> new BadRequestException("Bad request", method, url, corrId, body);
+            case 401 -> new UnauthorizedException("Unauthorized", method, url, corrId, body);
+            case 403 -> new ForbiddenException("Forbidden", method, url, corrId, body);
+            case 404 -> new NotFoundException("Not found", method, url, corrId, body);
+            case 409 -> new ConflictException("Conflict", method, url, corrId, body);
+            case 429 -> new TooManyRequestsException("Too Many Requests", method, url, corrId, body, retryAfter);
+            case 503 -> new ServiceUnavailableException("Service unavailable", method, url, corrId, body, null);
+            case 504 -> new GatewayTimeoutException("Upstream timed out", method, url, corrId, body, null);
+            default -> new ApiException("Upstream error " + sc, sc, method, url, corrId, body, null) {};
+        };
+    }
+
+    private RuntimeException mapTransportOrRetryErrors(Throwable t, ClientRequest req) {
+        String method = req.method().name();
+        String url = req.url().toString();
+
+        // Errors thrown by WebClient itself on 4xx/5xx (if any slipped through)
+        if (t instanceof WebClientResponseException wcre) {
+            String body = wcre.getResponseBodyAsString();
+            return mapStatusToException(wcre.getStatusCode(), body, req, wcre.getHeaders(), null);
+        }
+
+        // Our retry filter synthesizes this for 5xx/429 (after draining) → after retries, map to 503/429 equivalents
+        if (t instanceof RetryBackoffFilter.RetryableStatusException rse) {
+            int sc = rse.getStatus().value();
+            return switch (sc) {
+                case 429 -> new TooManyRequestsException("Too Many Requests (after retries)", method, url, null, null, null);
+                case 503, 500, 502, 504 -> new ServiceUnavailableException("Service unavailable (after retries)", method, url, null, null, t);
+                default -> new ApiException("Retryable upstream error " + sc, sc, method, url, null, null, t) {};
+            };
+        }
+
+        // Transport problems (connect refused, DNS, read timeout, Reactor timeout)
+        if (t instanceof WebClientRequestException wcre) {
+            Throwable cause = wcre.getCause();
+            if (cause instanceof ReadTimeoutException || cause instanceof TimeoutException) {
+                return new UpstreamTimeoutException("I/O timeout", method, url, null, t);
+            }
+            if (cause instanceof ConnectException || cause instanceof UnknownHostException || cause instanceof SocketException) {
+                return new UpstreamConnectException("Connection problem", method, url, null, t);
+            }
+        }
+        if (t instanceof TimeoutException) {
+            return new UpstreamTimeoutException("Upstream timed out", method, url, null, t);
+        }
+
+        // otherwise pass it through
+        return (t instanceof RuntimeException re) ? re : new RuntimeException(t);
+    }
+}
+
+```
+
+3) Wire it into your builder (make it the OUTERMOST filter)
+Put the error mapping first so it can see:
+normal error responses (4xx/5xx) and
+errors thrown by inner filters (e.g., our retry filter after retries).
+Also keep your request-mutating filters (correlation/auth) before retry so retries carry headers.
+
+```java
+// ApplicationBeanConfiguration.java (builder bean)
+@Bean
+@LoadBalanced
+public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+
+    var errorMapping = new ErrorMappingFilter();
+    var correlationFilter = new CorrelationHeaderFilter();
+    var authFilter = new AuthHeaderFilter(props::getAuthToken);
+
+    var retryFilter = new RetryBackoffFilter(
+            2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+
+    return WebClient.builder()
+            .clientConnector(connector)
+            .filters(list -> {
+                // OUTERMOST
+                list.add(errorMapping);
+
+                // mutate requests, then allow retry to re-run with headers
+                list.add(correlationFilter);
+                list.add(authFilter);
+
+                // INNER
+                list.add(retryFilter);
+            });
+}
+
+```
+
+4) (Optional) Turn exceptions into HTTP responses for your proxy
+   If you want your /proxy/** endpoints to respond with the same status (404/401/429/503…) instead of a 
+generic 500, add:
+
+```java
+// errors/GlobalErrorHandler.java
+package reactive.httpwebclientservice.errors;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class GlobalErrorHandler {
+
+    @ExceptionHandler(ApiException.class)
+    public ResponseEntity<String> handleApi(ApiException ex) {
+        // include correlation ID so clients can quote it
+        return ResponseEntity.status(ex.getStatus() != null ? ex.getStatus() : 502)
+                .header("X-Correlation-Id", ex.getCorrelationId() != null ? ex.getCorrelationId() : "N/A")
+                .body(ex.getMessage());
+    }
+}
+```
+(You can of course return a structured JSON error with code/message/details.)
+
+How this behaves
+401 from backend → UnauthorizedException → your advice returns 401 to caller.
+404 → NotFoundException.
+429 → retry filter may retry; if still failing, TooManyRequestsException (with Retry-After if present).
+503/5xx → retried; after retries, ServiceUnavailableException.
+Connect refused / DNS / read timeout → UpstreamConnectException or UpstreamTimeoutException.
+All done in code (no YAML), via your builder & filters—exactly the “tweakable WebClient” style you’re practicing.
+
+
+How to test the custom mapping?
+The webclient has a controller which accepts parameter for the number of Error Status code, so:
+```java
+@GetMapping("/proxy-http-status/{code}")
+    public Mono<ResponseEntity<String>> getCustomErrorResponse(@PathVariable int code) {
+        
+        //Always return the Mono (or Flux).
+        //That 'return value' is the contract you make with WebFlux. The incoming request has a Netty channel and
+        //that 'return value' is what ties that channel to your reactive pipeline.
+        return users.proxyGetCustomErrorResponse(code);    // non-blocking
+    }
+```
+Thus the web cilent will send the request to the backend-service, which will accept the request with this controller:
+```java
+@GetMapping("/http-status/{code}")
+    public ResponseEntity<String> getCustomErrorResponse(@PathVariable int code)
+    {
+        try {
+            HttpStatus status = HttpStatus.valueOf(code);
+
+            ResponseEntity<String> responseEntity = ResponseEntity
+                    .status(status)
+                    .body("Custom error with status: " + code);
+
+            return responseEntity;
+
+        } catch (IllegalArgumentException ex)
+        {
+            return ResponseEntity
+                    .status(HttpStatus.BAD_REQUEST)
+                    .body("Invalid HTTP status code: " + code);
+        }
+    }
+```
+As you see the backend-service will generate a Response with the status code, which it received.
+
+Now, since we have created custom mappings for most common status codes, we will not receive generic error messages
+for the relevant codes, but we will receive our custom error messages. This is how it works:
+The postman cilent sends this request:
+```text
+http://localhost:8080/proxy/proxy-http-status/404
+
+```
+The webcilent receives it sends it further to the backend-service. And the webclient will continue executing
+its code, because its non-blocking, asynchronous.
+The backend service receives the request with the value 404 and it and respond with this code:
+```text
+404 NOT_FOUND
+
+```
+The webcilent service and particularrly its Netty Channel will receive this custom message and will reply to 
+the Postman client.
+
+Same logic will be performed with any other code status which we also defined:
+
+If Postman sends: http://localhost:8080/proxy/proxy-http-status/504 , postman will receive:  
+503 Service Unavailable - 'Service unavailable (after retries)', 
+because this message we defined in 'public class ServiceUnavailableException extends ApiException'.
+NOTE: we send 504, but our definition is for 503. Therefore we also receive 503 as code. Little bit above, we
+already said these mappings are so:
+```text
+How this behaves
+401 from backend → UnauthorizedException → your advice returns 401 to caller.
+404 → NotFoundException.
+429 → retry filter may retry; if still failing, TooManyRequestsException (with Retry-After if present).
+503/5xx → retried; after retries, ServiceUnavailableException.
+```
+
+
+
+
+               END of experiment to customize the RestClient -  4. Custom Error Decoding & Mapping to Exceptions
+
+
+
+
+
+
+
+
+
+
+
+
 
 5. Custom JSON (Jackson) Configuration
    Suppose you want to use a custom ObjectMapper—for example, enabling a special date format, ignoring unknown fields,
