@@ -1,13 +1,23 @@
 package reactive.httpwebclientservice.config;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import io.netty.channel.ChannelOption;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.handler.timeout.WriteTimeoutHandler;
 import org.springframework.cloud.client.loadbalancer.LoadBalanced;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.MediaType;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.http.codec.json.Jackson2JsonDecoder;
+import org.springframework.http.codec.json.Jackson2JsonEncoder;
+import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.support.WebClientAdapter;
+import org.springframework.web.service.invoker.HttpServiceProxyFactory;
 import reactive.httpwebclientservice.HttpClientInterface;
 import reactive.httpwebclientservice.filters.AuthHeaderFilter;
 import reactive.httpwebclientservice.filters.CorrelationHeaderFilter;
@@ -16,6 +26,7 @@ import reactive.httpwebclientservice.filters.RetryBackoffFilter;
 import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
+import java.util.List;
 
 @Configuration
 public class ApplicationBeanConfiguration {
@@ -56,17 +67,65 @@ public class ApplicationBeanConfiguration {
      */
     @Bean
     @LoadBalanced
-    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector) {
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector,
+                                                          Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder) {
+
+
+        // 1) Build a Spring-aware base mapper (modules & features that Boot would normally register)
+        //    IMPORTANT: we do NOT modify the builder bean itself; we just call .build() to get an ObjectMapper.
+        ObjectMapper base = jackson2ObjectMapperBuilder.build();
+
+        // 2) Create separate enc/dec mappers so we can keep encode strict and decode lenient
+        ObjectMapper encoderMapper = base.copy()
+                // encode as ISO-8601 (no timestamps)
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                // don't serialize nulls (optional)
+                .setSerializationInclusion(JsonInclude.Include.NON_NULL);
+        // If your upstream is snake_case ONLY for this client, uncomment:
+        // .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+
+        ObjectMapper decoderMapper = base.copy()
+                // decode as ISO-8601 and be LENIENT to unknown fields from the upstream
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+        // 3) Support application/json and application/*+json
+        List<MediaType> jsonTypes = List.of(
+                MediaType.APPLICATION_JSON,
+                MediaType.valueOf("application/*+json")
+        );
+
+        Jackson2JsonEncoder encoder = new Jackson2JsonEncoder(
+                encoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+        Jackson2JsonDecoder decoder = new Jackson2JsonDecoder(
+                decoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+
+
+
 
         // Attach the retry filter here so every client built from this builder gets it.
-        var retryFilter = new RetryBackoffFilter(
-                2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+        var retryFilter = new RetryBackoffFilter(2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
         var errorMapping = new ErrorMappingFilter();
         var correlationFilter = new CorrelationHeaderFilter();
         var authFilter = new AuthHeaderFilter(props::getAuthToken);
 
+        // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
+                .codecs(c -> {
+                    c.defaultCodecs().jackson2JsonEncoder(encoder);
+                    c.defaultCodecs().jackson2JsonDecoder(decoder);
+                    // (optional) increase if you parse large payloads
+                    // c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024);
+                })
                 .filters(list -> {
                     // OUTERMOST
                     list.add(errorMapping);
@@ -88,8 +147,8 @@ public class ApplicationBeanConfiguration {
                 .baseUrl(host)
                 .build();
 
-        return org.springframework.web.service.invoker.HttpServiceProxyFactory
-                .builderFor(org.springframework.web.reactive.function.client.support.WebClientAdapter.create(webClient))
+        return HttpServiceProxyFactory
+                .builderFor(WebClientAdapter.create(webClient))
                 .build()
                 .createClient(HttpClientInterface.class);
     }

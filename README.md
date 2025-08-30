@@ -662,7 +662,7 @@ Postman, the browser, or any client at all.
 
 
 
-               START of experiment to customize the RestClient -  1. Adjusting Timeouts (Connect, Read, Write)
+               START of experiment to customize the WebClient -  1. Adjusting Timeouts (Connect, Read, Write)
 
 1. Adjusting Timeouts (Connect, Read, Write)
    By default, the underlying HTTP client (used by Spring’s RestClient) may have timeouts that are too long (or too short) for your
@@ -802,13 +802,13 @@ That’s it—pure builder-based configuration
 
 
 
-               END of experiment to customize the RestClient -  1. Adjusting Timeouts (Connect, Read, Write)
+               END of experiment to customize the WebClient -  1. Adjusting Timeouts (Connect, Read, Write)
 
 
 
 
 
-               START of experiment to customize the RestClient -  2. Adding a Retry/Backoff Strategy
+               START of experiment to customize the WebClient -  2. Adding a Retry/Backoff Strategy
 
 
 Great next step. For retries/backoff you’ve got two solid options:
@@ -1150,13 +1150,13 @@ filter above is the clearest, least magic approach.
 
 
 
-               END of experiment to customize the RestClient -  2. Adding a Retry/Backoff Strategy
+               END of experiment to customize the WebClient -  2. Adding a Retry/Backoff Strategy
 
 
 
 
 
-               START of experiment to customize the RestClient -  3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
+               START of experiment to customize the WebClient -  3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
 
 3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
    In a microservice world, you often want to propagate a “correlation ID” (for tracing across services) or inject an
@@ -1413,14 +1413,14 @@ This is how we tested our new functionality.
 
 
 
-               END of experiment to customize the RestClient -  3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
+               END of experiment to customize the WebClient -  3. Inserting Custom Headers (e.g., Correlation ID, Auth Token)
 
 
 
 
 
 
-               START of experiment to customize the RestClient -  4. Custom Error Decoding & Mapping to Exceptions
+               START of experiment to customize the WebClient -  4. Custom Error Decoding & Mapping to Exceptions
 
 4. Custom Error Decoding & Mapping to Exceptions
    By default, non‐2xx responses are turned into a generic form. You might want to map, say, a 404 to a
@@ -1829,7 +1829,7 @@ How this behaves
 
 
 
-               END of experiment to customize the RestClient -  4. Custom Error Decoding & Mapping to Exceptions
+               END of experiment to customize the WebClient -  4. Custom Error Decoding & Mapping to Exceptions
 
 
 
@@ -1838,15 +1838,288 @@ How this behaves
 
 
 
-
-
+               START of experiment to customize the WebClient -  5. Custom JSON (Jackson) Configuration
 
 
 
 5. Custom JSON (Jackson) Configuration
    Suppose you want to use a custom ObjectMapper—for example, enabling a special date format, ignoring unknown fields,
-   or registering a module (e.g. JSR310, Kotlin, Protobuf). You need to tell the RestClient to use your ObjectMapper when
+   or registering a module (e.g. JSR310, Kotlin, Protobuf). You need to tell the WebClient to use your ObjectMapper when
    serializing/deserializing request and response bodies.
+
+Working and customizing JSON and ObjectMapper requires the knowledge and explanation we already gave in the README.md
+file of the project: HTTPrestClientService. There we explain about what is ObjectMapper, what is spring-aware ObjectMapper,
+what is Jackson2ObjectMapperBuilder and what is Jackson2ObjectMapperBuilderCustomizer.
+
+These explanations are important because they help us chose the correct way to customize , depending on the
+context we have.
+
+A short summery of what we explained and researched in the README.md file of the project: HTTPrestClientService is this:
+
+```text
+        The mental model (3 layers)
+
+Where does the mapper come from?
+    G0 — Global, Spring-aware (preferred base): the auto-configured ObjectMapper or the Spring-provided Jackson2ObjectMapperBuilder. These already include Boot defaults (JavaTimeModule, Kotlin/Hibernate if present, spring.jackson.* props).
+    G1 — Spring-aware derived: build a new mapper from the injected Jackson2ObjectMapperBuilder → fresh instance, still Spring-aware.
+    G2 — Raw Jackson: new ObjectMapper() → clean but not Spring-aware (you’ll miss Boot’s defaults unless you add them yourself).
+
+Where will it be used? (scope/target)
+    S0 — Global app-wide: affects server @RestController, WebClient, RestClient, everything.
+    S1 — Per-client: only a specific WebClient (and HTTP Interface on top of it) or a specific RestClient.
+    S2 — Per-call: an occasional one-off call with different rules.
+
+How do you apply it? (wiring point)
+    W0 — Global customizer / mutation: Jackson2ObjectMapperBuilderCustomizer or mutate the auto-configured ObjectMapper.
+    W1 — WebClient codecs: WebClient.Builder → ExchangeStrategies with Jackson2JsonEncoder/Decoder.
+    W2 — RestClient converters: replace/add MappingJackson2HttpMessageConverter with your mapper.
+    W3 — Per-call derived client: webClient.mutate().exchangeStrategies(...).build() just for that one request.
+    W4 — DTO-directed knobs: @JsonFormat, @JsonView, mix-ins (applies regardless of mapper source).
+
+```
+
+That information about the context of these objects help us take decisions when -> what should we implement:
+```text
+Decision GUIDE (quick):
+“I want one JSON policy everywhere (controllers + clients) and keep Boot defaults.”
+→ Use W0: Jackson2ObjectMapperBuilderCustomizer (preferred) or mutate the injected global ObjectMapper.
+
+“Keep controllers on stock settings, but make my clients different.”
+→ Use G1 + S1: build a new, Spring-aware mapper from injected Jackson2ObjectMapperBuilder, then wire via W1 (WebClient) / W2 (RestClient).
+
+“I need two different client policies (e.g., legacy vs new API).”
+→ Multiple S1 builders, each with its own mapper from G1.
+
+“Just this one call needs a special content type or date format.”
+→ S2 via W3: create a derived WebClient for that call with tailored ExchangeStrategies (or switch MediaType to NDJSON, etc.).
+
+“I must control Protobuf/Smile/NDJSON too.”
+→ Add non-JSON codecs alongside Jackson in W1.
+
+```
+
+Now lets focus on the current task - a Custom JSON (Jackson) Configuration.  
+But what does the 'Custom JSON (Jackson) Configuration' actually mean? - it means to adjust how Jackson (the JSON library used by 
+Spring Boot) serializes and deserializes objects — instead of using only the defaults. That adjusting can include things like:
+- Changing date/time formats
+- Ignoring null fields
+- Enabling/disabling features (WRITE_DATES_AS_TIMESTAMPS, FAIL_ON_UNKNOWN_PROPERTIES, etc.)
+- Adding custom serializers/deserializers
+- Registering extra modules (e.g., JavaTimeModule)
+In short: it’s about telling Jackson how you want your JSON to look and behave in your Spring app.
+
+This 'adjusting' has this chain of roles: 
+Jackson2ObjectMapperBuilderCustomizer → customizes → Jackson2ObjectMapperBuilder → builds → JsonMapper (a specialized ObjectMapper) → does JSON work.
+As we see the final role in that chain is played by the JsonMapper.
+Ok, but what is difference between JsonMapper and ObjectMapper? How do they relate to each other?
+    Quick relationships:
+- ObjectMapper is the databind workhorse in Jackson: it turns JSON (or other data formats) ↔ Java objects.
+- JsonMapper is a subclass of ObjectMapper introduced later (Jackson 2.10+) that’s JSON-specific and comes with a builder (JsonMapper.builder()) and a few safer defaults for JSON out of the box.
+So: JsonMapper is not lower than ObjectMapper—it is an ObjectMapper (specialized for JSON) with a nicer builder API. You can use either in Spring; Spring just needs an ObjectMapper instance.
+
+There are other formats similar to JsonMapper:
+XmlMapper (XML), CBORMapper, SmileMapper, YAMLMapper — they are all specialized ObjectMappers tied to a specific JsonFactory.
+
+And short description of the conversion-chain. The steps the converting goes to:
+```text
+
+        The conversion chain (conceptual)
+
+When Jackson converts between bytes and objects, this is the pipeline:
+1. the HTTP layer (Spring):
+- Server: MappingJackson2HttpMessageConverter (MVC) or Jackson2JsonEncoder/Decoder (WebFlux)
+- Client: same classes on the client side (RestClient uses converters; WebClient uses codecs)
+
+2. the Databind layer (your ObjectMapper, which is actually the JsonMapper )
+- Looks up a serializer or deserializer for the target type
+- Applies modules you registered (e.g., JavaTimeModule, Jdk8Module, Afterburner, Kotlin)
+- Honors features & inclusion rules (FAIL_ON_UNKNOWN_PROPERTIES, NON_NULL, etc.)
+- Honors naming strategy (SNAKE_CASE, etc.) and date format
+
+3. Streaming layer (core)
+- Uses a JsonFactory → creates a JsonParser (read) / JsonGenerator (write) to actually read/write bytes
+
+Think of it as:
+HTTP wrapper → (your) Mapper config → (under the hood) streaming read/write.
+```
+
+    Summery:
+- JsonMapper extends ObjectMapper; it’s just the JSON-focused flavor with a builder.
+- The mapper (whichever you use) sits in the databind step between Spring’s HTTP codecs/converters and Jackson’s low-level streaming.
+- In Spring Boot projects, prefer Spring-aware builders/customizers when you want Boot’s defaults; otherwise JsonMapper.builder() is a great, explicit way to craft a JSON mapper.
+
+
+
+Now after we have clarified the 'subject' of our task - a 'Custom JSON (Jackson) Configuration', lets pick up
+one of all options to perform (implement) this customization - to customize globally, per client or per call?
+
+We decide to customize only on the level of the current existing WebClient, without affecting any other global configurations of
+other objects.
+
+You can give just this WebClient its own Jackson settings—without touching Spring Boot’s global ObjectMapper—by installing a custom encoder/decoder on the builder.
+Below is a drop-in update to your ApplicationBeanConfiguration which now applies customizations 
+for the JSON (Jackson) as per the task:
+
+```java
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    private final DserviceClientProperties props;
+
+    // Constructor injection of our properties holder
+    public ApplicationBeanConfiguration(DserviceClientProperties props) {
+        this.props = props;
+    }
+
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean
+    ReactorClientHttpConnector clientHttpConnector() {
+        HttpClient http = HttpClient.create()
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+
+                // RESPONSE timeout (time from request write until first response byte/headers)
+                .responseTimeout(Duration.ofSeconds(100))
+
+                // READ/WRITE inactivity timeouts (no bytes read/written for N seconds)
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
+                        .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
+                );
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+    /**
+     * A builder that applies the LoadBalancerExchangeFilterFunction
+     * so URIs like http://backend-service are resolved via Eureka.
+     */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector,
+                                                          Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder) {
+
+
+        // 1) Build a Spring-aware base mapper (modules & features that Boot would normally register)
+        //    IMPORTANT: we do NOT modify the builder bean itself; we just call .build() to get an ObjectMapper.
+        ObjectMapper base = jackson2ObjectMapperBuilder.build();
+
+        // 2) Create separate enc/dec mappers so we can keep encode strict and decode lenient
+        ObjectMapper encoderMapper = base.copy()
+                // encode as ISO-8601 (no timestamps)
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                // don't serialize nulls (optional)
+                .setSerializationInclusion(JsonInclude.Include.NON_NULL);
+        // If your upstream is snake_case ONLY for this client, uncomment:
+        // .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+
+        ObjectMapper decoderMapper = base.copy()
+                // decode as ISO-8601 and be LENIENT to unknown fields from the upstream
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+        // 3) Support application/json and application/*+json
+        List<MediaType> jsonTypes = List.of(
+                MediaType.APPLICATION_JSON,
+                MediaType.valueOf("application/*+json")
+        );
+
+        Jackson2JsonEncoder encoder = new Jackson2JsonEncoder(
+                encoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+        Jackson2JsonDecoder decoder = new Jackson2JsonDecoder(
+                decoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+
+
+
+
+        // Attach the retry filter here so every client built from this builder gets it.
+        var retryFilter = new RetryBackoffFilter(2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+        var errorMapping = new ErrorMappingFilter();
+        var correlationFilter = new CorrelationHeaderFilter();
+        var authFilter = new AuthHeaderFilter(props::getAuthToken);
+
+        // Build the LB-aware WebClient.Builder with custom per-client codecs
+        return WebClient.builder()
+                .clientConnector(connector)
+                .codecs(c -> {
+                    c.defaultCodecs().jackson2JsonEncoder(encoder);
+                    c.defaultCodecs().jackson2JsonDecoder(decoder);
+                    // (optional) increase if you parse large payloads
+                    // c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024);
+                })
+                .filters(list -> {
+                    // OUTERMOST
+                    list.add(errorMapping);
+
+                    // request-mutating filters should run BEFORE retry (so each retry has headers)
+                    // mutate requests, then allow retry to re-run with headers
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+
+                    // INNER
+                    list.add(retryFilter);
+                });
+    }
+
+    @Bean
+    public HttpClientInterface userHttpInterface(WebClient.Builder builder) {
+        String host = "http://" + props.getServiceId();  // e.g. http://backend-service
+        WebClient webClient = builder
+                .baseUrl(host)
+                .build();
+
+        return HttpServiceProxyFactory
+                .builderFor(WebClientAdapter.create(webClient))
+                .build()
+                .createClient(HttpClientInterface.class);
+    }
+}
+
+```
+To test if the configuration is applied modify the
+```text
+.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+```
+set it from false to true - and you will see that some HTTP Calls simply fail.
+
+
+
+
+               END of experiment to customize the WebClient -  5. Custom JSON (Jackson) Configuration
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 6. Metrics & Instrumentation
    In production, you’ll want to track how many calls you’re making, response times, error rates, etc. You can hook in Micrometer or

@@ -99,6 +99,4 @@ public class UserProxyController {
         return users.getById(id, ver)
                 .contextWrite(ctx -> ctx.put(CTX_KEY, corrId)); // ← seed once; filter reads it
     }
-
-
 }
