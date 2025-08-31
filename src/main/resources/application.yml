@@ -31,4 +31,9 @@ dservice:
 #  Later, your code will read user.base-url instead of having builder.baseUrl("http://localhost:8081") hard-coded.
 
 
+logging:
+  level:
+    org.springframework.cloud.client.loadbalancer: DEBUG
+    org.springframework.cloud.loadbalancer: DEBUG
+    org.springframework.cloud.loadbalancer.core: DEBUG
 

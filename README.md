@@ -2908,10 +2908,7 @@ More extensive testing would require additional configurations.
 
 
 
-
-
-
-
+               START of experiment to customize the WebClient -  8. Custom Load-Balancing Rules (Zone/Affinity, Metadata-based Routing)
 
 
 8. Custom Load-Balancing Rules (Zone/Affinity, Metadata-based Routing)
@@ -2919,6 +2916,464 @@ More extensive testing would require additional configurations.
    Zone Affinity: Prefer instances in the same zone/region as the client.
    Metadata Filtering: Only use instances that have a specific metadata label (e.g. version=v2).
    Weighting: Give some instances higher “weight” if they’re more powerful.
+
+From a variety of ways to implement LoadBalancer lets try to distinguish the contexts:
+
+Here’s a compact “mental model” + exactly how to wire per-service (not global) load-balancing behavior for your 
+WebClient talking to Eureka-registered backend-service.
+
+            Mental model (quick)
+
+- Client-side LB (you already use this): Your @LoadBalanced WebClient.Builder installs a 
+filter that asks Spring Cloud LoadBalancer to choose a ServiceInstance (from Eureka) before the HTTP call is sent.
+Default algorithm is round-robin.
+
+- Where LB can live:
+  1. Inside your client (WebClient + Spring Cloud LoadBalancer) → what we customize here.
+     Spring Cloud LoadBalancer can work with any client! But only with clients! Spring Cloud LoadBalancer “the one” for 
+     any client - including the Spring WebClient. Spring Cloud LoadBalancer is only client side LB.
+     It’s the maintained, Ribbon-successor client-side LB in Spring Cloud (2020+). It works with Eureka/Consul/etc.,
+     integrates with WebClient via @LoadBalanced, and is the standard choice in Spring apps.
+     If you need more advanced LB (outlier detection, rich routing), that’s usually done server-side (Spring Cloud 
+     Gateway) - read below point 2. 'edge/gateway' → server-side. Or via a service mesh (Envoy/Istio/Linkerd) — not in the WebClient itself.
+   2. At the edge/gateway (e.g., Spring Cloud Gateway) → server-side.
+   3. Outside the app (Nginx/ALB/Envoy/service mesh) → infrastructure level.
+  
+- How to scope config:
+  1. Per service ID: @LoadBalancerClient(name="backend-service", configuration=...) gives only that target a 
+  custom chain (best for you).
+  2. Global: set spring.cloud.loadbalancer.configurations=... or provide a primary ServiceInstanceListSupplier 
+bean (affects all).
+
+    
+        Global vs per-service
+
+- Per-service (recommended here): the @LoadBalancerClient(name="backend-service", configuration=...) you saw 
+gives you precise control without affecting other outbound clients.
+- Global: set spring.cloud.loadbalancer.configurations: zone-preference (or weighted, health-check, 
+same-instance-preference, request-based-sticky-session, subset) to switch all clients to those behaviors, or 
+expose a global ServiceInstanceListSupplier bean. Useful only if every target should behave the same.
+
+
+        The current setup in the project:
+
+With just @LoadBalanced WebClient.Builder and no custom supplier/config, I am using the default round-robin over 
+healthy instances from Eureka. No zone preference, weights, hints, or metadata filtering are active unless I
+add them.
+
+
+        Other LB “families” to be aware of
+
+- Client-side (in your app): Spring Cloud LoadBalancer (what you have).
+- Gateway/server-side: Spring Cloud Gateway / API gateways.
+- Infrastructure: Mesh/proxy (Envoy/NGINX/K8s Service/ALB).
+- Protocol-specific: gRPC’s pick_first/round_robin (if using gRPC).
+
+4) Good questions to decide before customizing
+
+- Scope: Per-service vs. global policy? (Use @LoadBalancerClient(name="…", configuration=…) for per-service.)
+- Routing policy: Round-robin vs. zone-affinity, weights, hints/metadata (canary version=v2).
+- Stickiness: Need request-based sticky sessions or same-instance preference for idempotent flows?
+- Retries interplay: On retry, pick a different instance or the same? (Affects resilience.)
+- Health/outlier handling: How do you avoid bad instances (health checks, circuit breaker per instance)?
+- Observability: Enable LB DEBUG logs/metrics to verify distribution & chosen instances.
+- Fallbacks: What if Eureka returns no instances? (Static URL fallback or fail fast.)
+Where to place LB: Keep in client, or move to gateway/mesh if you need richer policies at the edge.
+
+
+The project already implements the Spring Cloud LoadBalancer for the WebClient. Now let's add custom
+for backend-service (zone-affinity + weights + hint/metadata routing), without changing your WebClient code.
+
+1) Add per-service LB configuration hook
+
+HttpWebClientServiceApplication (ADD the annotation @LoadBalancerClient, keep the rest as-is), so:
+
+```java
+// ⬇️ ADD: import
+import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;
+
+// ⬇️ ADD this annotation to bind a custom LB config ONLY for "backend-service"
+@LoadBalancerClient(
+    name = "backend-service",
+    configuration = BackendServiceLbConfig.class   // <- per-service LB config lives here
+)
+@SpringBootApplication
+public class HttpWebClientServiceApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(HttpWebClientServiceApplication.class, args);
+    }
+
+}
+
+```
+
+2) New per-service LB config class
+   Add NEW file: BackendServiceLbConfig.java
+```java
+
+package reactive.httpwebclientservice.config;
+
+import org.springframework.cloud.client.loadbalancer.reactive.LoadBalancerClientRequestTransformer;
+import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.web.reactive.function.client.ClientRequest;
+import org.springframework.cloud.client.ServiceInstance;
+
+import java.util.List;
+
+/**
+ * Per-service LoadBalancer chain applied only for "backend-service" via @LoadBalancerClient.
+ * Features:
+ *  - Discovery-backed list (Eureka)
+ *  - Zone preference (prefer instances in same zone as this client)
+ *  - Hint-based routing (built-in: X-SC-LB-Hint header vs instance metadata "hint")
+ *  - Weighted strategy (instance metadata key "weight", default 1)
+ *  - Caching (perf)
+ *  - OPTIONAL: extra filtering by custom metadata key "version" using header "X-Version"
+ */
+//@Configuration this annotation is not necessary - does not seem to make any difference. It still works without it.
+public class BackendServiceLbConfig
+{
+
+    /** Build the supplier chain for THIS service id. */
+    @Bean
+    ServiceInstanceListSupplier backendServiceInstanceSupplier(ConfigurableApplicationContext context) {
+        // Built-in chain builder
+        ServiceInstanceListSupplier base =
+                ServiceInstanceListSupplier.builder()
+                        .withDiscoveryClient()        // pull from Eureka
+                        .withCaching()     //<<---- PUT it up here !!!
+                        .withZonePreference()         // prefer same-zone instances
+                        .withHints()                  // enable X-SC-LB-Hint / metadata: hint
+                        .withWeighted()               // use metadata: weight
+                        //.withCaching()     <<---- REMOVE it from here !!!
+                        .build(context);
+
+        // OPTIONAL: add our custom metadata filter by key "version" driven by header "X-Version"
+        return new VersionMetadataFilteringSupplier(base, "version");
+
+    }
+
+    /**
+     * Optional helper: stamp the chosen instance id into the outgoing request headers
+     * so you can SEE which instance actually served the call (helpful in logs).
+     */
+    @Bean
+    public LoadBalancerClientRequestTransformer addChosenInstanceHeader() {
+        return (request, instance) -> ClientRequest.from(request)
+                .header("X-InstanceId", safeInstanceId(instance))
+                .build();
+    }
+
+    private static String safeInstanceId(ServiceInstance si) {
+        try { return si.getInstanceId(); }
+        catch (Exception ignored) { return si.getHost() + ":" + si.getPort(); }
+    }
+}
+```
+
+Add NEW file: VersionMetadataFilteringSupplier.java , so:
+
+```java
+package reactive.httpwebclientservice.config;
+
+import org.springframework.cloud.client.ServiceInstance;
+import org.springframework.cloud.client.loadbalancer.Request;
+import org.springframework.cloud.client.loadbalancer.RequestData;
+import org.springframework.cloud.client.loadbalancer.RequestDataContext;
+import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;
+import reactor.core.publisher.Flux;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Decorator that prefers instances whose metadata[{metadataKey}] equals request header "X-Version".
+ * If no matches, it falls back to the original list.
+ */
+final class VersionMetadataFilteringSupplier implements ServiceInstanceListSupplier {
+
+    private final ServiceInstanceListSupplier delegate;
+    private final String metadataKey;
+
+    VersionMetadataFilteringSupplier(ServiceInstanceListSupplier delegate, String metadataKey) {
+        this.delegate = delegate;
+        this.metadataKey = metadataKey;
+    }
+
+    @Override
+    public String getServiceId() {
+        return delegate.getServiceId();
+    }
+
+    @Override
+    public Flux<List<ServiceInstance>> get() {
+        return delegate.get();
+    }
+
+    @Override
+    public Flux<List<ServiceInstance>> get(Request request) {
+        String desired = null;
+
+        Object ctx = request.getContext();
+        if (ctx instanceof RequestDataContext rdc) {
+            RequestData data = rdc.getClientRequest();
+            if (data != null && data.getHeaders() != null) {
+                desired = data.getHeaders().getFirst("X-Version"); // <- header drives desired metadata value
+            }
+        }
+
+        final String want = desired;
+
+        return delegate.get(request).map(list -> {
+            if (want == null || want.isBlank()) return list;
+            List<ServiceInstance> filtered = list.stream()
+                    .filter(si -> want.equals(si.getMetadata().get(metadataKey)))
+                    .collect(Collectors.toList());
+            return filtered.isEmpty() ? list : filtered; // fallback when no match
+        });
+    }
+}
+
+```
+
+3) (Optional) Tell LB what client zone this app is in — without YAML
+   Zone preference compares the client’s zone to instance metadata "zone". If you don’t want to put it in 
+application.yml, you can define the config bean in code (demo value shown):
+   / ⬇️ Add this BEAN anywhere in your @Configuration (e.g., in ApplicationBeanConfiguration)
+   //     so zone-preference knows your client's zone.
+   //     If you already set spring.cloud.loadbalancer.zone in YAML, omit this.
+```java
+
+// ⬇️ Add this BEAN anywhere in your @Configuration (e.g., in ApplicationBeanConfiguration)
+//     so zone-preference knows your client's zone.
+//     If you already set spring.cloud.loadbalancer.zone in YAML, omit this.
+import org.springframework.cloud.loadbalancer.config.LoadBalancerZoneConfig;
+
+@Bean  // <<< OPTIONAL (code-based client zone)
+public LoadBalancerZoneConfig loadBalancerZoneConfig() {
+    return new LoadBalancerZoneConfig("eu-west-1a"); // set YOUR client zone here
+}
+
+```
+I added it in the ApplicationBeanConfiguration.
+
+Next, Backend instances should advertise zone & other metadata in Eureka:
+```yml
+
+eureka:
+  instance:
+    metadata-map:
+      zone: eu-west-1a
+      weight: "5"       # stronger node
+      hint: v2          # for built-in Hint supplier
+      version: v2       # for our custom VersionMetadataFilteringSupplier
+```
+
+After adding all these cinfigurations above, what do we expect to happen? Answer is:
+- when we send any GET request via Postman client and when we add a header:
+  X-Version=v1 - this will always connect to the backend-service which is configured to use the v1
+  X-Version=v2 - this will always connect to the other backend-service which is configured to use the v2
+
+- when we send any GET request via Postman client and when we add a header:
+  X-SC-LB-Hint=v1 - this will always connect to the backend-service which is configured to use the v1
+  X-SC-LB-Hint=v2 - this will always connect to the backend-service which is configured to use the v2
+
+The difference between the two headers is this:
+- X-SC-LB-Hint — built-in Spring Cloud LoadBalancer hint.
+    If your supplier chain includes .withHints() and the outgoing WebClient request carries this header, 
+    SCLB prefers instances whose Eureka metadata hint equals the header value (e.g., hint=v2). No custom code needed.
+- X-Version — your custom routing header.
+  It works because we added VersionMetadataFilteringSupplier, which reads X-Version and prefers instances whose 
+Eureka metadata version matches (e.g., version=v2). This is per-service and fully under your control.
+
+What this gives you: header-driven, per-request targeting—perfect for canary/blue-green routing and A/B tests.
+With a match, SCLB round-robins within the matched subset; if no match, our custom filter falls back to the full 
+set.
+
+
+4) How to drive it per request (no code changes required)
+- Weights: just set metadata.weight on instances.
+- Zone affinity: set client zone (bean above) + instance metadata.zone.
+- Built-in hint routing: add header X-SC-LB-Hint: v2 on a request; it prefers instances with metadata.hint=v2.
+- Custom version routing (our decorator): add header X-Version: v2; it prefers instances with metadata.version=v2.
+You can add those headers in your controller or via a small ExchangeFilterFunction if you want it automatic for specific endpoints
+But at this point I have not added anything from that point 4).
+
+Let's move on:
+
+5) Nothing else in your code must change
+Your existing @LoadBalanced WebClient.Builder continues to work as-is. Because we bound BackendServiceLbConfig 
+only to backend-service via @LoadBalancerClient, all calls to http://backend-service/... now go through the custom
+chain.
+
+
+Add this to your application.yml:
+```yml
+logging:
+  level:
+    org.springframework.cloud.client.loadbalancer: DEBUG    # this plays general for later to see the debug when testing
+    org.springframework.cloud.loadbalancer: DEBUG
+    org.springframework.cloud.loadbalancer.core: DEBUG
+
+```
+You’ll see logs about chosen instances & filters. 
+
+
+Since we expect that different headers will always call different backend-services, we have to have also
+ backend-services, which are configured to look for the specific headers. 
+This configuration we did in the backend-service in the application.yml
+like so (above):
+```yml
+eureka:
+  ....
+  instance:
+    metadata-map:
+      zone: "eu-west-1a"
+      weight: "5"       # stronger node
+      hint: "v2"          # for built-in Hint supplier
+      version: "v2"       # for our custom VersionMetadataFilteringSupplier
+```
+, but this will be applied only to one running instance. But we need two instances with different hint and version values;
+To achieve this we start the app on the command line terminal so:
+Switch to the other project - backend-service
+Open terminal in the project folder.
+./gradlew clean
+export DB_USERNAME=BlaBla
+export DB_PASSWORD=BlaBla
+java -jar build/libs/dservice-0.0.1-SNAPSHOT.jar   --server.port=8081   --eureka.instance.metadata-map.version=v1   --eureka.instance.metadata-map.hint=v1
+(NB! see the command above sets the version=v1 and hint=v1 for that particular instance.)
+
+, THEN open second separate terminal in the same project backend-service:
+Open terminal in the project folder.
+./gradlew clean
+export DB_USERNAME=BlaBla
+export DB_PASSWORD=BlaBla
+java -jar build/libs/dservice-0.0.1-SNAPSHOT.jar   --server.port=8079   --eureka.instance.metadata-map.version=v2   --eureka.instance.metadata-map.hint=v2
+(NB! see the command above sets the version=v2 and hint=v2 for that particular instance.)
+
+Now we have two instances and we can distinguish between then using differen header values:
+version=v2 and hint=v2
+and
+version=v1 and hint=v1
+
+Now lets use Postman and send GET request to an endpoint. But which endpoint? Well, any endpoint which extracts
+the headers from the incoming request would do! In our existing controllers such endpoint we already have:
+for example:
+```java
+
+@GetMapping("/user-with-data/{id}")
+    public Mono<ResponseEntity<UserDbDTO>> getWithData(
+            @PathVariable Long id,
+            @RequestHeader Map<String, String> headers) //<<---- this plays crucial role !!!
+{
+
+        return users.getWithData(id, headers);    
+    }
+```
+Send GET request from Postman like this:
+http://localhost:8080/proxy/user-with-data/1
+with header: X-Version = v2
+Watch the printed console logs: you will always get response from the backend-service which was started with 
+the parameters version = v2
+Now change the headers from v2 to v1. Now you will always get response from the other instance which was 
+started with the parameters version = v1
+
+Next, we want to test the other header: X-SC-LB-Hint - serves the same purpose, but its built-in. No need for me to manually create it.
+Send GET reqeut from postman like this:
+
+Add a brand new endpoint in the UserProxyController class just for the testing purpose:
+```java
+ // ⬇️ NEW: forward Postman headers to the WebClient so LB can use them
+    @GetMapping("/user-hinted/{id}")
+    public Mono<ResponseEntity<UserDTO>> getByIdHinted(
+            @PathVariable Long id,
+            @RequestHeader Map<String, String> headers) {
+        // you can still set/override headers here if you want:
+        // headers.putIfAbsent("X-API-Version", "v1");
+        return users.getByIdWithHints(id, headers);
+    }
+
+```
+Now send the request: http://localhost:8080/proxy/user-hinted/3
+with a header: X-SC-LB-Hint = v2
+, then with a header: X-SC-LB-Hint = v1
+
+UNFORTUNATELY, this had no effect.  
+This header: X-SC-LB-Hint = v2 was returning responses from both instances, randomly. But it was supposed to return response 
+only from the instace configured with the v2 value.
+Not sure yet, what is the problem there. 
+I continued my investigation and it turned out that the problem was in the 'caching' in the class
+BackendServiceLbConfig in the method: backendServiceInstanceSupplier , so:
+This must be commented out: .withCaching()
+```java
+ServiceInstanceListSupplier.builder()
+                        .withDiscoveryClient()        // pull from Eureka
+                        .withZonePreference()         // prefer same-zone instances
+                        .withHints()                  // enable X-SC-LB-Hint / metadata: hint
+                        .withWeighted()               // use metadata: weight
+                        //.withCaching()                // cache list for perf
+                        .build(context);
+```
+Once I have disabled it by commenting it out, the built-in Hint started to work and the LoadBalancer successfully
+started to pass the requests with a header 'X-SC-LB-Hint' to the correct backend-service instance.
+
+Works success!!
+
+        Why did this problem happen?
+Why it happened: when .withCaching() wraps the hint filter, the first result (often unfiltered) gets cached and 
+reused for later requests—so per-request headers like X-SC-LB-Hint can’t change the instance list.
+
+        How to solve the problem, but to keep the caching because we want to have it active!?
+
+Keep caching (for perf) and keep hints working by caching before per-request filters. In other words change the
+place when you call the caching - move it up in the method chain call so:
+````java
+@Bean
+    ServiceInstanceListSupplier backendServiceInstanceSupplier(ConfigurableApplicationContext context) {
+        // Built-in chain builder
+        ServiceInstanceListSupplier base =
+                ServiceInstanceListSupplier.builder()
+                        .withDiscoveryClient()        // pull from Eureka
+                        .withCaching()     //<<---- PUT it up here !!!
+                        .withZonePreference()         // prefer same-zone instances
+                        .withHints()                  // enable X-SC-LB-Hint / metadata: hint
+                        .withWeighted()               // use metadata: weight
+                        //.withCaching()     <<---- REMOVE it from here !!!
+                        .build(context);
+
+        // OPTIONAL: add our custom metadata filter by key "version" driven by header "X-Version"
+        return new VersionMetadataFilteringSupplier(base, "version");
+
+    }
+````
+
+Now I tested it and it still works correctly!!!
+
+
+P.S. tip:
+Prod tip: add Caffeine so SCLB uses a real cache (gets rid of the startup warning):
+```gradle
+implementation 'com.github.ben-manes.caffeine:caffeine'
+
+```
+
+
+
+
+
+               END of experiment to customize the WebClient -  8. Custom Load-Balancing Rules (Zone/Affinity, Metadata-based Routing)
+
+
+
+
+
+
+
+
+
 
 9. Circuit-Breaker with Fallback to a Local Stub
    Sometimes, instead of throwing an exception when the breaker is open, you want to return a default “fallback” response

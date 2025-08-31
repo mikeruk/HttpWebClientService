@@ -44,4 +44,10 @@ public interface HttpClientInterface {
             accept      = MediaType.APPLICATION_OCTET_STREAM_VALUE
     )
     Mono<ResponseEntity<Void>> uploadFile(@RequestBody Resource file);
+
+    // lets us pass arbitrary headers (e.g., X-Version, X-SC-LB-Hint)
+    @GetExchange("/user/{id}")
+    Mono<ResponseEntity<UserDTO>> getByIdWithHints(
+            @PathVariable Long id,
+            @RequestHeader Map<String, String> headers);
 }

@@ -119,5 +119,15 @@ public class UserProxyController {
                 .toList();
     }
 
+    // forward Postman headers to the WebClient so LB can use them
+    @GetMapping("/user-hinted/{id}")
+    public Mono<ResponseEntity<UserDTO>> getByIdHinted(
+            @PathVariable Long id,
+            @RequestHeader Map<String, String> headers) {
+        // you can still set/override headers here if you want:
+        // headers.putIfAbsent("X-API-Version", "v1");
+        return users.getByIdWithHints(id, headers);
+    }
+
 
 }

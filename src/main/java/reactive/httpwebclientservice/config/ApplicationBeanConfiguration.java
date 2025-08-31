@@ -19,6 +19,7 @@ import io.netty.channel.ChannelOption;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.handler.timeout.WriteTimeoutHandler;
 import org.springframework.cloud.client.loadbalancer.LoadBalanced;
+import org.springframework.cloud.loadbalancer.config.LoadBalancerZoneConfig;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
@@ -187,6 +188,12 @@ public class ApplicationBeanConfiguration {
                 .maxWaitDuration(Duration.ofMillis(0)) // fail-fast when saturated
                 .build();
         return BulkheadRegistry.of(bhConfig);
+    }
+
+
+    @Bean  // <<< OPTIONAL (code-based client zone)
+    public LoadBalancerZoneConfig loadBalancerZoneConfig() {
+        return new LoadBalancerZoneConfig("eu-west-1a"); // set YOUR client zone here
     }
 
     /**
