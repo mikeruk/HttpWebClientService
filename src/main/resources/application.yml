@@ -11,7 +11,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: metrics,prometheus
+        include: metrics,prometheus,circuitbreakers,circuitbreakerevents
 
 
 

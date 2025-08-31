@@ -37,6 +37,14 @@ dependencies {
     implementation 'io.micrometer:micrometer-registry-prometheus' // optional
 
 
+    // For the purpose of 7. Circuit Breaker / Bulkhead (Resilience4j Integration)
+    // Resilience4j for Reactor (CircuitBreaker, Bulkhead operators)
+    implementation 'io.github.resilience4j:resilience4j-reactor:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-circuitbreaker:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-bulkhead:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-spring-boot3:2.2.0'
+    // (optional) metrics auto-binding if you want:
+    implementation 'io.github.resilience4j:resilience4j-micrometer:2.2.0'
 
 }
 

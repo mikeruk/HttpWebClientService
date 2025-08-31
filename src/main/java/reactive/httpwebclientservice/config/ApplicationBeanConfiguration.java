@@ -4,6 +4,10 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.common.KeyValue;
 import io.micrometer.common.KeyValues;
 import io.micrometer.core.instrument.Meter;
@@ -29,10 +33,8 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.support.WebClientAdapter;
 import org.springframework.web.service.invoker.HttpServiceProxyFactory;
 import reactive.httpwebclientservice.HttpClientInterface;
-import reactive.httpwebclientservice.filters.AuthHeaderFilter;
-import reactive.httpwebclientservice.filters.CorrelationHeaderFilter;
-import reactive.httpwebclientservice.filters.ErrorMappingFilter;
-import reactive.httpwebclientservice.filters.RetryBackoffFilter;
+import reactive.httpwebclientservice.exceptions.ApiException;
+import reactive.httpwebclientservice.filters.*;
 import reactive.httpwebclientservice.utils.Correlation;
 import reactor.netty.http.client.HttpClient;
 
@@ -137,6 +139,55 @@ public class ApplicationBeanConfiguration {
     }
 
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Resilience4j registries with code-based configuration (no YAML)
+    // ──────────────────────────────────────────────────────────────────────────
+    @Bean
+    CircuitBreakerRegistry circuitBreakerRegistry() {
+        CircuitBreakerConfig cbConfig = CircuitBreakerConfig.custom()
+                .failureRateThreshold(50f)                       // open CB if ≥50% of calls fail
+                .slowCallRateThreshold(50f)                      // or ≥50% are "slow"
+                .slowCallDurationThreshold(Duration.ofSeconds(2))// calls slower than this are "slow"
+                .waitDurationInOpenState(Duration.ofSeconds(10)) // stay OPEN for 10s
+                .permittedNumberOfCallsInHalfOpenState(5)        // trial calls when HALF_OPEN
+                .minimumNumberOfCalls(10)                        // don’t judge until we have 10 samples
+                .slidingWindowSize(50)                           // last 50 calls
+                .recordException(t -> {
+                    if (t instanceof ApiException api) {
+                        Integer s = api.getStatus();
+                        // don't trip on 4xx; do trip on 5xx/429
+                        return s == null || s >= 500 || s == 429;
+                    }
+                    return true; // timeouts/connect/etc.
+                })  // don’t count 4xx client errors
+                .build();
+        return CircuitBreakerRegistry.of(cbConfig);
+    }
+
+    // Decide which exceptions should open the breaker.
+    private boolean recordForCircuitBreaker(Throwable t)
+    {
+        // Treat 4xx as "business" outcomes: do NOT open CB for them.
+        if (t instanceof ApiException api) {
+            Integer s = api.getStatus();
+            if (s != null && s >= 400 && s < 500) {
+                return false; // 4xx don’t trip the breaker
+            }
+            // 5xx/429 should trip
+            return true;
+        }
+        // Transport/timeouts should trip
+        return true;
+    }
+
+    @Bean
+    BulkheadRegistry bulkheadRegistry() {
+        BulkheadConfig bhConfig = BulkheadConfig.custom()
+                .maxConcurrentCalls(50)              // cap concurrent in-flight calls
+                .maxWaitDuration(Duration.ofMillis(0)) // fail-fast when saturated
+                .build();
+        return BulkheadRegistry.of(bhConfig);
+    }
 
     /**
      * A builder that applies the LoadBalancerExchangeFilterFunction
@@ -152,7 +203,10 @@ public class ApplicationBeanConfiguration {
     public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector,
                                                           Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
                                                           ObservationRegistry observationRegistry,
-                                                          ClientRequestObservationConvention webClientObservationConvention) {
+                                                          ClientRequestObservationConvention webClientObservationConvention,
+                                                          CircuitBreakerRegistry circuitBreakerRegistry,
+                                                          BulkheadRegistry bulkheadRegistry)
+    {
 
         // Per-client, Spring-aware mappers:
         // 1) Build a Spring-aware base mapper (modules & features that Boot would normally register)
@@ -201,6 +255,16 @@ public class ApplicationBeanConfiguration {
         var correlationFilter = new CorrelationHeaderFilter();
         var authFilter = new AuthHeaderFilter(props::getAuthToken);
 
+        // NEW: CircuitBreaker + Bulkhead filter.
+        // Name the CB/Bulkhead after the Eureka serviceId so all calls to that service share the same protections.
+        var r4jFilter = new Resilience4jFilter(
+                circuitBreakerRegistry,
+                bulkheadRegistry,
+                req -> props.getServiceId() // e.g. "backend-service"
+                // Alternative per-endpoint naming:
+                // req -> req.method().name() + " " + req.url().getPath()
+        );
+
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
@@ -214,7 +278,13 @@ public class ApplicationBeanConfiguration {
                     // c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024);
                 })
                 .filters(list -> {
-                    // OUTERMOST
+
+                    // We want the CircuitBreaker/Bulkhead to wrap EVERYTHING (including retry + error mapping),
+                    // and we want retry to happen INSIDE the breaker (so one logical call is counted once).
+                    // So we insert r4jFilter at index 0 (OUTERMOST).
+                    list.add(0, r4jFilter);          // <-- NEW (outermost)
+
+                    // OUTERMOST (was) -> now second outermost(now the r4jFilter is OUTERMOST)
                     list.add(errorMapping);
 
                     // request-mutating filters should run BEFORE retry (so each retry has headers)

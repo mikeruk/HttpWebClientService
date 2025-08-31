@@ -2709,25 +2709,210 @@ reactor.netty.http.client.data.received, reactor.netty.connection.provider.activ
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+               START of experiment to customize the WebClient -  7. Circuit Breaker / Bulkhead (Resilience4j Integration)
 
 
 7. Circuit Breaker / Bulkhead (Resilience4j Integration)
    Repeated failures to your backend (e.g. DB down) should not cascade into your entire system. A circuit breaker lets you “trip”
    after N failures and avoid hammering a bad endpoint.
+
+
+
+1) build.gradle — add Resilience4j (reactor)
+First, add these new dependencies:
+```gradle
+// For the purpose of 7. Circuit Breaker / Bulkhead (Resilience4j Integration)
+    // Resilience4j for Reactor (CircuitBreaker, Bulkhead operators)
+    implementation 'io.github.resilience4j:resilience4j-reactor:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-circuitbreaker:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-bulkhead:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-spring-boot3:2.2.0'
+    // (optional) metrics auto-binding if you want:
+    implementation 'io.github.resilience4j:resilience4j-micrometer:2.2.0'
+
+```
+
+Expose the endpoints in yml:
+```yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics,prometheus,circuitbreakers,circuitbreakerevents
+```
+
+2) New filter that wraps each call with Bulkhead and CircuitBreaker
+
+```java
+// src/main/java/reactive/httpwebclientservice/filters/Resilience4jFilter.java
+package reactive.httpwebclientservice.filters;
+
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.reactor.bulkhead.operator.BulkheadOperator;
+import io.github.resilience4j.reactor.circuitbreaker.operator.CircuitBreakerOperator;
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Mono;
+
+import java.util.Objects;
+import java.util.function.Function;
+
+/**
+ * Wraps the WebClient exchange Publisher with Bulkhead and CircuitBreaker operators.
+ * Name resolution is pluggable to support per-service or per-endpoint breakers.
+ */
+public class Resilience4jFilter implements ExchangeFilterFunction {
+
+    private final CircuitBreakerRegistry cbRegistry;
+    private final BulkheadRegistry bhRegistry;
+    private final Function<ClientRequest, String> nameResolver;
+
+    public Resilience4jFilter(CircuitBreakerRegistry cbRegistry,
+                              BulkheadRegistry bhRegistry,
+                              Function<ClientRequest, String> nameResolver) {
+        this.cbRegistry = Objects.requireNonNull(cbRegistry);
+        this.bhRegistry = Objects.requireNonNull(bhRegistry);
+        this.nameResolver = Objects.requireNonNull(nameResolver);
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        String name = nameResolver.apply(request);
+        CircuitBreaker cb = cbRegistry.circuitBreaker(name);
+        Bulkhead bh = bhRegistry.bulkhead(name);
+
+        // Ensure Bulkhead limits are applied, then CB records the overall result.
+        // Because we’ll place this filter OUTERMOST, it will also “see” errors produced by inner filters (e.g., ErrorMapping).
+        return next.exchange(request)
+                .transformDeferred(BulkheadOperator.of(bh))
+                .transformDeferred(CircuitBreakerOperator.of(cb));
+    }
+}
+
+```
+
+3) Update ApplicationBeanConfiguration with this code:
+```java
+@Bean
+CircuitBreakerRegistry circuitBreakerRegistry() {
+    CircuitBreakerConfig cbConfig = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50f)                       // open CB if ≥50% of calls fail
+            .slowCallRateThreshold(50f)                      // or ≥50% are "slow"
+            .slowCallDurationThreshold(Duration.ofSeconds(2))// calls slower than this are "slow"
+            .waitDurationInOpenState(Duration.ofSeconds(10)) // stay OPEN for 10s
+            .permittedNumberOfCallsInHalfOpenState(5)        // trial calls when HALF_OPEN
+            .minimumNumberOfCalls(10)                        // don’t judge until we have 10 samples
+            .slidingWindowSize(50)                           // last 50 calls
+            .recordException(t -> {
+                if (t instanceof ApiException api) {
+                    Integer s = api.getStatus();
+                    // don't trip on 4xx; do trip on 5xx/429
+                    return s == null || s >= 500 || s == 429;
+                }
+                return true; // timeouts/connect/etc.
+            })  // don’t count 4xx client errors
+            .build();
+    return CircuitBreakerRegistry.of(cbConfig);
+}
+```
+
+        How this behaves (quickly)
+
+- Bulkhead caps concurrent in-flight calls (fails fast when saturated).
+
+- Circuit Breaker:
+  a) Ignores 4xx (your ErrorMappingFilter maps them to ApiException with 4xx → we don’t record them).
+  b) Counts 5xx/429 and transport/timeouts as failures.
+  c) With the filter placed outermost, it “sees” final success/failure after your internal retry attempts and error mapping.
+
+- You can rename breakers per endpoint by changing the nameResolver.
+
+If you want per-endpoint policies (e.g., stricter CB for /user-with-data/**), create additional 
+registries/configs or use registry.circuitBreaker("GET /api/v1/user-with-data") via the resolver.
+
+Test on this endpoint:
+http://localhost:8080/actuator
+Result is:
+
+```json
+{
+    "names": [
+        "application.ready.time",
+        "application.started.time",
+        "disk.free",
+        "disk.total",
+        "executor.active",
+        "executor.completed",
+        "executor.pool.core",
+        "executor.pool.max",
+        "executor.pool.size",
+        "executor.queue.remaining",
+        "executor.queued",
+        "http.client.requests",
+        "http.client.requests.active",
+        "http.server.requests",
+        "http.server.requests.active",
+        "jvm.buffer.count",
+        "jvm.buffer.memory.used",
+        "jvm.buffer.total.capacity",
+        "jvm.classes.loaded",
+        "jvm.classes.unloaded",
+        "jvm.compilation.time",
+        "jvm.gc.live.data.size",
+        "jvm.gc.max.data.size",
+        "jvm.gc.memory.allocated",
+        "jvm.gc.memory.promoted",
+        "jvm.gc.overhead",
+        "jvm.gc.pause",
+        "jvm.info",
+        "jvm.memory.committed",
+        "jvm.memory.max",
+        "jvm.memory.usage.after.gc",
+        "jvm.memory.used",
+        "jvm.threads.daemon",
+        "jvm.threads.live",
+        "jvm.threads.peak",
+        "jvm.threads.started",
+        "jvm.threads.states",
+        "logback.events",
+        "process.cpu.time",
+        "process.cpu.usage",
+        "process.files.max",
+        "process.files.open",
+        "process.start.time",
+        "process.uptime",
+        "system.cpu.count",
+        "system.cpu.usage",
+        "system.load.average.1m",
+        "tomcat.sessions.active.current",
+        "tomcat.sessions.active.max",
+        "tomcat.sessions.alive.max",
+        "tomcat.sessions.created",
+        "tomcat.sessions.expired",
+        "tomcat.sessions.rejected"
+    ]
+}
+```
+
+More extensive testing would require additional configurations.
+
+
+
+
+
+               END of experiment to customize the WebClient -  7. Circuit Breaker / Bulkhead (Resilience4j Integration)
+
+
+
+
+
+
+
+
+
+
 
 8. Custom Load-Balancing Rules (Zone/Affinity, Metadata-based Routing)
    By default, Spring Cloud LoadBalancer uses a simple round-robin. Sometimes you want:
