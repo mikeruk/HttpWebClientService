@@ -4,6 +4,13 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import io.micrometer.common.KeyValue;
+import io.micrometer.common.KeyValues;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.config.MeterFilter;
+import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
+import io.micrometer.observation.ObservationRegistry;
 import io.netty.channel.ChannelOption;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.handler.timeout.WriteTimeoutHandler;
@@ -15,6 +22,9 @@ import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.http.codec.json.Jackson2JsonDecoder;
 import org.springframework.http.codec.json.Jackson2JsonEncoder;
 import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
+import org.springframework.web.reactive.function.client.ClientRequestObservationContext;
+import org.springframework.web.reactive.function.client.ClientRequestObservationConvention;
+import org.springframework.web.reactive.function.client.DefaultClientRequestObservationConvention;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.support.WebClientAdapter;
 import org.springframework.web.service.invoker.HttpServiceProxyFactory;
@@ -23,6 +33,7 @@ import reactive.httpwebclientservice.filters.AuthHeaderFilter;
 import reactive.httpwebclientservice.filters.CorrelationHeaderFilter;
 import reactive.httpwebclientservice.filters.ErrorMappingFilter;
 import reactive.httpwebclientservice.filters.RetryBackoffFilter;
+import reactive.httpwebclientservice.utils.Correlation;
 import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
@@ -40,7 +51,8 @@ public class ApplicationBeanConfiguration {
 
     /** Low-level Reactor Netty client with timeouts. */
     @Bean
-    ReactorClientHttpConnector clientHttpConnector() {
+    ReactorClientHttpConnector clientHttpConnector()
+    {
         HttpClient http = HttpClient.create()
                 // CONNECT timeout (TCP handshake)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
@@ -52,10 +64,79 @@ public class ApplicationBeanConfiguration {
                 .doOnConnected(conn -> conn
                         .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
                         .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
-                );
+                )
+                // (Optional) enable Reactor Netty client I/O metrics (Micrometer-backed) at the socket level:
+                .metrics(true, uri -> uri); // <— use this public overload;
+
 
         return new ReactorClientHttpConnector(http);
     }
+
+
+    /** Optional: system-wide meter filters (apply to all registries). */
+    @Bean
+    MeterFilter commonTags() {
+        return MeterFilter.commonTags(Tags.of("app", "HttpWebClientService"));
+    }
+
+    /** Optional: configure percentiles/histograms for http client timers. */
+    @Bean
+    MeterFilter httpClientPercentiles() {
+        return new MeterFilter() {
+            @Override
+            public DistributionStatisticConfig configure(Meter.Id id, DistributionStatisticConfig config) {
+                if ("http.client.requests".equals(id.getName())) {
+                    return DistributionStatisticConfig.builder()
+                            .percentiles(0.5, 0.95, 0.99)
+                            .percentilesHistogram(true)
+                            .serviceLevelObjectives(
+                                    Duration.ofMillis(50).toNanos(),
+                                    Duration.ofMillis(100).toNanos(),
+                                    Duration.ofMillis(250).toNanos(),
+                                    Duration.ofMillis(500).toNanos(),
+                                    Duration.ofSeconds(1).toNanos()
+                            )
+                            .build()
+                            .merge(config); // keep existing settings + yours
+                }
+                return config; // leave others unchanged
+            }
+        };
+    }
+
+    /** A custom observation convention to add low-cardinality tags (e.g., serviceId, apiVersion). */
+    @Bean
+    ClientRequestObservationConvention webClientObservationConvention()
+    {
+        return new DefaultClientRequestObservationConvention()
+        {
+            @Override
+            public String getName()
+            {
+                // keep default meter name "http.client.requests"
+                return super.getName();
+            }
+
+            @Override
+            public KeyValues getLowCardinalityKeyValues(ClientRequestObservationContext context)
+            {
+                KeyValues defaults = super.getLowCardinalityKeyValues(context);
+                String serviceId = props.getServiceId(); // e.g. "backend-service"
+                String apiVersion = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst("X-API-Version") : null;
+                String corr = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst(Correlation.HEADER) : null;
+
+                return defaults.and(
+                        KeyValue.of("service.id", serviceId == null ? "unknown" : serviceId),
+                        KeyValue.of("api.version", apiVersion == null ? "none" : apiVersion),
+                        KeyValue.of("corr.present", corr == null ? "no" : "yes")
+                );
+            }
+        };
+    }
+
+
 
     /**
      * A builder that applies the LoadBalancerExchangeFilterFunction
@@ -65,12 +146,15 @@ public class ApplicationBeanConfiguration {
      * Load-balanced builder so "http://backend-service" resolves via Eureka.
      * We plug our connector in here—no YAML required.
      */
+    /** Load-balanced builder with: per-client Jackson + observation + your filters. */
     @Bean
     @LoadBalanced
     public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector,
-                                                          Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder) {
+                                                          Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
+                                                          ObservationRegistry observationRegistry,
+                                                          ClientRequestObservationConvention webClientObservationConvention) {
 
-
+        // Per-client, Spring-aware mappers:
         // 1) Build a Spring-aware base mapper (modules & features that Boot would normally register)
         //    IMPORTANT: we do NOT modify the builder bean itself; we just call .build() to get an ObjectMapper.
         ObjectMapper base = jackson2ObjectMapperBuilder.build();
@@ -120,6 +204,9 @@ public class ApplicationBeanConfiguration {
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
+                // <<< this enables WebClient Observations/metrics
+                .observationRegistry(observationRegistry)
+                .observationConvention(webClientObservationConvention)
                 .codecs(c -> {
                     c.defaultCodecs().jackson2JsonEncoder(encoder);
                     c.defaultCodecs().jackson2JsonDecoder(decoder);

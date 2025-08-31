@@ -7,7 +7,11 @@ eureka:
       defaultZone: "http://localhost:8761/eureka"
     register-with-eureka: true     # register as HttpWebClientService
     fetch-registry: true           # fetch registry to enable load-balancing
-
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics,prometheus
 
 
 

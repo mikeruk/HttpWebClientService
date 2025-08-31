@@ -2104,26 +2104,626 @@ set it from false to true - and you will see that some HTTP Calls simply fail.
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+               START of experiment to customize the WebClient -  6. Metrics & Instrumentation
 
 
 
 6. Metrics & Instrumentation
-   In production, you’ll want to track how many calls you’re making, response times, error rates, etc. You can hook in Micrometer or
-   Spring Boot’s MeterRegistry and record metrics around every request.
+In production, you’ll want to track how many calls you’re making, response times, error rates, etc. 
+You can hook in Micrometer or Spring Boot’s MeterRegistry and record metrics around every request.
+
+Before I continue with implementing task 06 for the WEbCilent, I want to have a clear view of the available 
+options, consider which are suitable for WebClient or for which scenarios?
+
+Here’s the quick mental model you asked for, then I’ll show exactly how to wire it for WebClient.
+
+    "Mental model" (who does what):
+- Micrometer (MeterRegistry) → numbers/metrics (counters, timers, histograms).
+- Micrometer Observation (ObservationRegistry) → the bridge that times things and can emit both metrics and traces.
+- Spring WebClient Observability → built into Spring Framework: when you give the builder an ObservationRegistry, it adds an observation filter so every call records http.client.requests with tags like method, status, uri, clientName, etc.
+- MeterFilter → tweaks/filters metrics (add common tags, rename/deny, sanitize tag values).
+- Feign’s MicrometerCapability/MicrometerObservationCapability → Feign-specific. Not used for WebClient.
+
+
+Could there be any additional options in Spring Galaxy, which potentially can be used for the same purpose, 
+but I probably did not ask about?
+
+    Here is "ADDITIONAL LIST" :
+- Micrometer Tracing (OpenTelemetry/Zipkin): micrometer-tracing + -bridge-otel or -bridge-brave for spans of WebClient calls.
+- Reactor Netty I/O metrics: HttpClient.create().metrics(true) for connection/pool/socket stats.
+- MeterFilter / ObservationFilter beans: shape/deny/rename metrics or enrich observations globally.
+- WebClientCustomizer: drop-in bean to auto-add observation/filters to all WebClient builders.
+- Spring Cloud LoadBalancer metrics: per-service instance stats.
+- Resilience4j + Micrometer: circuit-breaker/retry/bulkhead metrics around WebClient calls.
+- Actuator metrics endpoints: /actuator/metrics, /actuator/prometheus for scraping/export.
+
+, compared the ones on the "Mental Model" with the ones in the "ADDITIONAL LIST",
+what we will do here as DEMO will be the standard, recommended way for WebClient in Spring 6 / Boot 3:
+
+- Add Actuator → you get ObservationRegistry + MeterRegistry.
+- Call .observationRegistry(...) (and optionally .observationConvention(...)) on your WebClient.Builder.
+- You get http.client.requests timers with sane tags out of the box.
+- Use MeterFilter for histograms/common tags; optionally enable Reactor Netty I/O metrics.
+
+This is the typical, production-ready approach for WebClient; Feign’s Micrometer capabilities are Feign-specific
+and not needed here.
+
+
+First, add new dependencies:
+```gradle
+implementation 'org.springframework.boot:spring-boot-starter-actuator'
+implementation 'io.micrometer:micrometer-registry-prometheus' // optional
+
+```
+
+, and then we enable Reactor Netty client I/O metrics (Micrometer-backed), so:
+```java
+
+@Bean
+ReactorClientHttpConnector clientHttpConnector() {
+    HttpClient http = HttpClient.create()
+        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+        .responseTimeout(Duration.ofSeconds(100))
+        .doOnConnected(conn -> conn
+            .addHandlerLast(new ReadTimeoutHandler(30))
+            .addHandlerLast(new WriteTimeoutHandler(10)))
+        // enable Reactor Netty client I/O metrics (Micrometer-backed)  <<---- THIS IS THE NEW ADDITION
+        .metrics(true, uri -> uri); // <— use this public overload      <<---- THIS IS THE NEW ADDITION
+
+    return new ReactorClientHttpConnector(http);
+}
+```
+
+Next, we add /** Optional: system-wide meter filters (apply to all registries). */, so:
+```java
+/** Optional: system-wide meter filters (apply to all registries). */
+@Bean
+MeterFilter commonTags() {
+    return MeterFilter.commonTags(Tags.of("app", "HttpWebClientService"));
+}
+
+```
+Thus we are not overriding anything. it’s additive, not a replacement.
+- Declaring a @Bean MeterFilter adds your filter to the registry; it doesn’t wipe out Spring Boot’s property-driven filters (e.g., from management.metrics.*) or other MeterFilter beans.
+- Spring Boot orders all MeterFilter beans (by @Order/Ordered) and then registers them in order. Use this if precedence matters:
+- Watch out for duplicate tag keys (e.g., management.metrics.tags.app + your commonTags("app", ...)). Prefer a single source or ensure unique keys.
+
+Next, add /** Optional: configure percentiles/histograms for http client timers. */, so:
+
+```java
+/** Optional: configure percentiles/histograms for http client timers. */
+@Bean
+MeterFilter httpClientPercentiles() {
+    return new MeterFilter() {
+        @Override
+        public DistributionStatisticConfig configure(Meter.Id id, DistributionStatisticConfig config) {
+            if ("http.client.requests".equals(id.getName())) {
+                return DistributionStatisticConfig.builder()
+                        .percentiles(0.5, 0.95, 0.99)
+                        .percentilesHistogram(true)
+                        .serviceLevelObjectives(
+                                Duration.ofMillis(50).toNanos(),
+                                Duration.ofMillis(100).toNanos(),
+                                Duration.ofMillis(250).toNanos(),
+                                Duration.ofMillis(500).toNanos(),
+                                Duration.ofSeconds(1).toNanos()
+                        )
+                        .build()
+                        .merge(config); // keep existing settings + yours
+            }
+            return config; // leave others unchanged
+        }
+    };
+}
+```
+It tweaks how the http.client.requests timer aggregates latency:
+- Targets the meter by name and applies a DistributionStatisticConfig.
+- percentiles(0.5, 0.95, 0.99) → publishes p50/p95/p99.
+- percentilesHistogram(true) → adds histogram buckets (for Prometheus histograms/heatmaps).
+- serviceLevelObjectives(...) → explicit SLO bucket bounds (in nanos for timers).
+- Trade-off: more time series & memory, but you get rich latency visibility and SLO-aligned alerts.
+
+
+Next, add  /** A custom observation convention to add low-cardinality tags (e.g., serviceId, apiVersion). */
+, so:
+```java
+/** A custom observation convention to add low-cardinality tags (e.g., serviceId, apiVersion). */
+    @Bean
+    ClientRequestObservationConvention webClientObservationConvention()
+    {
+        return new DefaultClientRequestObservationConvention()
+        {
+            @Override
+            public String getName()
+            {
+                // keep default meter name "http.client.requests"
+                return super.getName();
+            }
+
+            @Override
+            public KeyValues getLowCardinalityKeyValues(ClientRequestObservationContext context)
+            {
+                KeyValues defaults = super.getLowCardinalityKeyValues(context);
+                String serviceId = props.getServiceId(); // e.g. "backend-service"
+                String apiVersion = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst("X-API-Version") : null;
+                String corr = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst(Correlation.HEADER) : null;
+
+                return defaults.and(
+                        KeyValue.of("service.id", serviceId == null ? "unknown" : serviceId),
+                        KeyValue.of("api.version", apiVersion == null ? "none" : apiVersion),
+                        KeyValue.of("corr.present", corr == null ? "no" : "yes")
+                );
+            }
+        };
+    }
+```
+It’s a hook that customizes the tags Micrometer adds to each WebClient metric/trace.
+By providing a ClientRequestObservationConvention, you can add low-cardinality key–values (e.g., service.id,
+api.version, corr.present) to http.client.requests while keeping default tags. You then pass this bean to the
+builder via .observationConvention(...). Low-cardinality = safe for metrics (no explosion of time series).
+
+Next, add these two:
+.observationRegistry(observationRegistry)
+.observationConvention(webClientObservationConvention)
+, to the return WebClient.builder(). ..... 
+
+And the final public class ApplicationBeanConfiguration looks so:
+
+```java
+
+package reactive.httpwebclientservice.config;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import io.micrometer.common.KeyValue;
+import io.micrometer.common.KeyValues;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.config.MeterFilter;
+import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
+import io.micrometer.observation.ObservationRegistry;
+import io.netty.channel.ChannelOption;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import org.springframework.cloud.client.loadbalancer.LoadBalanced;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.http.codec.json.Jackson2JsonDecoder;
+import org.springframework.http.codec.json.Jackson2JsonEncoder;
+import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
+import org.springframework.web.reactive.function.client.ClientRequestObservationContext;
+import org.springframework.web.reactive.function.client.ClientRequestObservationConvention;
+import org.springframework.web.reactive.function.client.DefaultClientRequestObservationConvention;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.support.WebClientAdapter;
+import org.springframework.web.service.invoker.HttpServiceProxyFactory;
+import reactive.httpwebclientservice.HttpClientInterface;
+import reactive.httpwebclientservice.filters.AuthHeaderFilter;
+import reactive.httpwebclientservice.filters.CorrelationHeaderFilter;
+import reactive.httpwebclientservice.filters.ErrorMappingFilter;
+import reactive.httpwebclientservice.filters.RetryBackoffFilter;
+import reactive.httpwebclientservice.utils.Correlation;
+import reactor.netty.http.client.HttpClient;
+
+import java.time.Duration;
+import java.util.List;
+
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    private final DserviceClientProperties props;
+
+    // Constructor injection of our properties holder
+    public ApplicationBeanConfiguration(DserviceClientProperties props) {
+        this.props = props;
+    }
+
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean
+    ReactorClientHttpConnector clientHttpConnector()
+    {
+        HttpClient http = HttpClient.create()
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+
+                // RESPONSE timeout (time from request write until first response byte/headers)
+                .responseTimeout(Duration.ofSeconds(100))
+
+                // READ/WRITE inactivity timeouts (no bytes read/written for N seconds)
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
+                        .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
+                )
+                // (Optional) enable Reactor Netty client I/O metrics (Micrometer-backed) at the socket level:
+                .metrics(true, uri -> uri); // <— use this public overload;
+
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+
+    /** Optional: system-wide meter filters (apply to all registries). */
+    @Bean
+    MeterFilter commonTags() {
+        return MeterFilter.commonTags(Tags.of("app", "HttpWebClientService"));
+    }
+
+    /** Optional: configure percentiles/histograms for http client timers. */
+    @Bean
+    MeterFilter httpClientPercentiles() {
+        return new MeterFilter() {
+            @Override
+            public DistributionStatisticConfig configure(Meter.Id id, DistributionStatisticConfig config) {
+                if ("http.client.requests".equals(id.getName())) {
+                    return DistributionStatisticConfig.builder()
+                            .percentiles(0.5, 0.95, 0.99)
+                            .percentilesHistogram(true)
+                            .serviceLevelObjectives(
+                                    Duration.ofMillis(50).toNanos(),
+                                    Duration.ofMillis(100).toNanos(),
+                                    Duration.ofMillis(250).toNanos(),
+                                    Duration.ofMillis(500).toNanos(),
+                                    Duration.ofSeconds(1).toNanos()
+                            )
+                            .build()
+                            .merge(config); // keep existing settings + yours
+                }
+                return config; // leave others unchanged
+            }
+        };
+    }
+
+    /** A custom observation convention to add low-cardinality tags (e.g., serviceId, apiVersion). */
+    @Bean
+    ClientRequestObservationConvention webClientObservationConvention()
+    {
+        return new DefaultClientRequestObservationConvention()
+        {
+            @Override
+            public String getName()
+            {
+                // keep default meter name "http.client.requests"
+                return super.getName();
+            }
+
+            @Override
+            public KeyValues getLowCardinalityKeyValues(ClientRequestObservationContext context)
+            {
+                KeyValues defaults = super.getLowCardinalityKeyValues(context);
+                String serviceId = props.getServiceId(); // e.g. "backend-service"
+                String apiVersion = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst("X-API-Version") : null;
+                String corr = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst(Correlation.HEADER) : null;
+
+                return defaults.and(
+                        KeyValue.of("service.id", serviceId == null ? "unknown" : serviceId),
+                        KeyValue.of("api.version", apiVersion == null ? "none" : apiVersion),
+                        KeyValue.of("corr.present", corr == null ? "no" : "yes")
+                );
+            }
+        };
+    }
+
+
+
+    /**
+     * A builder that applies the LoadBalancerExchangeFilterFunction
+     * so URIs like http://backend-service are resolved via Eureka.
+     */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
+    /** Load-balanced builder with: per-client Jackson + observation + your filters. */
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector,
+                                                          Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
+                                                          ObservationRegistry observationRegistry,
+                                                          ClientRequestObservationConvention webClientObservationConvention) {
+
+        // Per-client, Spring-aware mappers:
+        // 1) Build a Spring-aware base mapper (modules & features that Boot would normally register)
+        //    IMPORTANT: we do NOT modify the builder bean itself; we just call .build() to get an ObjectMapper.
+        ObjectMapper base = jackson2ObjectMapperBuilder.build();
+
+        // 2) Create separate enc/dec mappers so we can keep encode strict and decode lenient
+        ObjectMapper encoderMapper = base.copy()
+                // encode as ISO-8601 (no timestamps)
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                // don't serialize nulls (optional)
+                .setSerializationInclusion(JsonInclude.Include.NON_NULL);
+        // If your upstream is snake_case ONLY for this client, uncomment:
+        // .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+
+        ObjectMapper decoderMapper = base.copy()
+                // decode as ISO-8601 and be LENIENT to unknown fields from the upstream
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+        // 3) Support application/json and application/*+json
+        List<MediaType> jsonTypes = List.of(
+                MediaType.APPLICATION_JSON,
+                MediaType.valueOf("application/*+json")
+        );
+
+        Jackson2JsonEncoder encoder = new Jackson2JsonEncoder(
+                encoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+        Jackson2JsonDecoder decoder = new Jackson2JsonDecoder(
+                decoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+
+
+
+
+        // Attach the retry filter here so every client built from this builder gets it.
+        var retryFilter = new RetryBackoffFilter(2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+        var errorMapping = new ErrorMappingFilter();
+        var correlationFilter = new CorrelationHeaderFilter();
+        var authFilter = new AuthHeaderFilter(props::getAuthToken);
+
+        // Build the LB-aware WebClient.Builder with custom per-client codecs
+        return WebClient.builder()
+                .clientConnector(connector)
+                // <<< this enables WebClient Observations/metrics
+                .observationRegistry(observationRegistry)
+                .observationConvention(webClientObservationConvention)
+                .codecs(c -> {
+                    c.defaultCodecs().jackson2JsonEncoder(encoder);
+                    c.defaultCodecs().jackson2JsonDecoder(decoder);
+                    // (optional) increase if you parse large payloads
+                    // c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024);
+                })
+                .filters(list -> {
+                    // OUTERMOST
+                    list.add(errorMapping);
+
+                    // request-mutating filters should run BEFORE retry (so each retry has headers)
+                    // mutate requests, then allow retry to re-run with headers
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+
+                    // INNER
+                    list.add(retryFilter);
+                });
+    }
+
+    @Bean
+    public HttpClientInterface userHttpInterface(WebClient.Builder builder) {
+        String host = "http://" + props.getServiceId();  // e.g. http://backend-service
+        WebClient webClient = builder
+                .baseUrl(host)
+                .build();
+
+        return HttpServiceProxyFactory
+                .builderFor(WebClientAdapter.create(webClient))
+                .build()
+                .createClient(HttpClientInterface.class);
+    }
+}
+```
+
+The App starts with success. To test and see the new metrics, create an endpoint in the RestController, so:
+Add the private final MeterRegistry registry in the class UserProxyController  so:
+```java
+@RestController
+@RequestMapping("/proxy")       // <— choose any prefix you like
+public class UserProxyController {
+
+    private final HttpClientInterface users;
+    private final MeterRegistry registry;
+
+    public UserProxyController(HttpClientInterface users, MeterRegistry registry) {
+        this.users = users;
+        this.registry = registry;
+    }
+    
+    
+    //........
+}
+
+```
+And create the endpoint RequestController:
+```java
+@GetMapping("/debug/http-client-metrics")
+  List<Map<String,Object>> httpClient() {
+    return registry.get("http.client.requests").timers().stream()
+      .map(t -> Map.of(
+          "tags", t.getId().getTags(),            // includes method, uri, status, clientName, + your custom tags
+          "count", t.count(),
+          "meanMs", t.mean(TimeUnit.MILLISECONDS),
+          "p95Ms", t.takeSnapshot().percentileValues().length > 0
+                    ? t.takeSnapshot().percentileValues()[0].value(TimeUnit.MILLISECONDS) : null
+      ))
+      .toList();
+  }
+
+```
+Now send a request to it via Postman: http://localhost:8080/proxy/debug/http-client-metrics
+The result is:
+```json
+[
+    {
+        "meanMs": 10.6894125,
+        "p95Ms": 4.456448,
+        "tags": [
+            {
+                "key": "app",
+                "value": "HttpWebClientService"
+            },
+            {
+                "key": "client.name",
+                "value": "localhost"
+            },
+            {
+                "key": "error",
+                "value": "none"
+            },
+            {
+                "key": "exception",
+                "value": "none"
+            },
+            {
+                "key": "method",
+                "value": "PUT"
+            },
+            {
+                "key": "outcome",
+                "value": "SUCCESS"
+            },
+            {
+                "key": "status",
+                "value": "200"
+            },
+            {
+                "key": "uri",
+                "value": "none"
+            }
+        ],
+        "count": 2
+    },
+    {
+        "meanMs": 39.283089,
+        "p95Ms": 6.029312,
+        "tags": [
+            {
+                "key": "app",
+                "value": "HttpWebClientService"
+            },
+            {
+                "key": "client.name",
+                "value": "localhost"
+            },
+            {
+                "key": "error",
+                "value": "none"
+            },
+            {
+                "key": "exception",
+                "value": "none"
+            },
+            {
+                "key": "method",
+                "value": "GET"
+            },
+            {
+                "key": "outcome",
+                "value": "SUCCESS"
+            },
+            {
+                "key": "status",
+                "value": "200"
+            },
+            {
+                "key": "uri",
+                "value": "none"
+            }
+        ],
+        "count": 3
+    },
+    {
+        "meanMs": 37.499568,
+        "p95Ms": 0.0,
+        "tags": [
+            {
+                "key": "app",
+                "value": "HttpWebClientService"
+            },
+            {
+                "key": "client.name",
+                "value": "localhost"
+            },
+            {
+                "key": "error",
+                "value": "none"
+            },
+            {
+                "key": "exception",
+                "value": "none"
+            },
+            {
+                "key": "method",
+                "value": "POST"
+            },
+            {
+                "key": "outcome",
+                "value": "SUCCESS"
+            },
+            {
+                "key": "status",
+                "value": "204"
+            },
+            {
+                "key": "uri",
+                "value": "none"
+            }
+        ],
+        "count": 1
+    }
+]
+
+```
+
+Another way and actually the recommended way to see the metrics we activated is possible if we have added the:
+implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+And since we really added it, we can use only this in the application.yml:
+```yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics,prometheus
+```
+Now do this:
+
+List timer:
+GET http://localhost:8080/actuator/metrics/http.client.requests
+
+Drill into a series (example):
+GET http://localhost:8080/actuator/metrics/http.client.requests?tag=method:GET&tag=client.name:localhost
+GET http://localhost:8080/actuator/metrics/http.client.requests?tag=method:GET
+For Netty I/O meters (if you enabled .metrics(true, uri -> uri)): look for names like
+reactor.netty.http.client.data.received, reactor.netty.connection.provider.active.connections, etc.
+
+
+
+
+
+               END of experiment to customize the WebClient -  6. Metrics & Instrumentation
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 7. Circuit Breaker / Bulkhead (Resilience4j Integration)
    Repeated failures to your backend (e.g. DB down) should not cascade into your entire system. A circuit breaker lets you “trip”

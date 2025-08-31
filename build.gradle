@@ -30,6 +30,14 @@ dependencies {
     // for implementing Custom Load-Balancing rules for  8. Custom Load-Balancing Rules (Zone/Affinity, Metadata-based Routing)
     // https://mvnrepository.com/artifact/org.springframework.cloud/spring-cloud-starter-loadbalancer
     implementation group: 'org.springframework.cloud', name: 'spring-cloud-starter-loadbalancer', version: '4.3.0'
+
+
+    // For the purpose of 6. Metrics & Instrumentation
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'io.micrometer:micrometer-registry-prometheus' // optional
+
+
+
 }
 
 tasks.named('test') {

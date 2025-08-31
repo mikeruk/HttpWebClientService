@@ -1,5 +1,6 @@
 package reactive.httpwebclientservice.controllers;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -9,7 +10,9 @@ import reactive.httpwebclientservice.HttpClientInterface;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import static reactive.httpwebclientservice.utils.Correlation.*;
@@ -20,9 +23,11 @@ import static reactive.httpwebclientservice.utils.Correlation.*;
 public class UserProxyController {
 
     private final HttpClientInterface users;
+    private final MeterRegistry registry;
 
-    public UserProxyController(HttpClientInterface users) {
+    public UserProxyController(HttpClientInterface users, MeterRegistry registry) {
         this.users = users;
+        this.registry = registry;
     }
 
     @PostMapping("/create-new-user")
@@ -99,4 +104,20 @@ public class UserProxyController {
         return users.getById(id, ver)
                 .contextWrite(ctx -> ctx.put(CTX_KEY, corrId)); // ← seed once; filter reads it
     }
+
+
+    @GetMapping("/debug/http-client-metrics")
+    List<Map<String,Object>> httpClient() {
+        return registry.get("http.client.requests").timers().stream()
+                .map(t -> Map.of(
+                        "tags", t.getId().getTags(),            // includes method, uri, status, clientName, + your custom tags
+                        "count", t.count(),
+                        "meanMs", t.mean(TimeUnit.MILLISECONDS),
+                        "p95Ms", t.takeSnapshot().percentileValues().length > 0
+                                ? t.takeSnapshot().percentileValues()[0].value(TimeUnit.MILLISECONDS) : null
+                ))
+                .toList();
+    }
+
+
 }
