@@ -3371,13 +3371,29 @@ implementation 'com.github.ben-manes.caffeine:caffeine'
 
 
 
+               START of experiment to customize the WebClient -  9. Circuit-Breaker with Fallback to a Local Stub
 
 
+
+
+        I AM SKIPPING THIS next task. I will implement it later !!!
 
 
 9. Circuit-Breaker with Fallback to a Local Stub
    Sometimes, instead of throwing an exception when the breaker is open, you want to return a default “fallback” response
    (e.g. cached data, empty user, placeholder).
+
+
+
+
+               END of experiment to customize the WebClient -  9. Circuit-Breaker with Fallback to a Local Stub
+
+
+
+
+
+
+
 
 10. Uploading Large Files: Tune Buffer Size / Memory Limits
     If you need to send or receive large payloads (e.g. >10 MB), the default in-memory buffering may not suffice. You might want to raise
