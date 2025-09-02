@@ -18,7 +18,9 @@ import io.micrometer.observation.ObservationRegistry;
 import io.netty.channel.ChannelOption;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.handler.timeout.WriteTimeoutHandler;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.cloud.client.loadbalancer.LoadBalanced;
+import org.springframework.cloud.client.loadbalancer.reactive.ReactorLoadBalancerExchangeFilterFunction;
 import org.springframework.cloud.loadbalancer.config.LoadBalancerZoneConfig;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -53,7 +55,7 @@ public class ApplicationBeanConfiguration {
     }
 
     /** Low-level Reactor Netty client with timeouts. */
-    @Bean
+    @Bean("defaultConnector")
     ReactorClientHttpConnector clientHttpConnector()
     {
         HttpClient http = HttpClient.create()
@@ -72,6 +74,27 @@ public class ApplicationBeanConfiguration {
                 .metrics(true, uri -> uri); // <— use this public overload;
 
 
+        return new ReactorClientHttpConnector(http);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // NEW: a more tolerant connector specifically for VERY large uploads.
+    //  - no write-idle timeout (or set it very high)
+    //  - longer overall response timeout
+    // Keep your general connector strict for normal traffic.
+    // ──────────────────────────────────────────────────────────────────────────
+    @Bean("uploadConnector")
+    ReactorClientHttpConnector uploadClientHttpConnector() {
+        HttpClient http = HttpClient.create()
+                .wiretap(true)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
+                .responseTimeout(Duration.ofHours(24)) // uploads can be LONG
+                .doOnConnected(conn -> conn
+                        // Disable write-idle timeout for streaming TBs
+                        .addHandlerLast(new ReadTimeoutHandler(0))   // 0 = disabled
+                        .addHandlerLast(new WriteTimeoutHandler(0))
+                )
+                .metrics(true, uri -> uri);
         return new ReactorClientHttpConnector(http);
     }
 
@@ -207,7 +230,7 @@ public class ApplicationBeanConfiguration {
     /** Load-balanced builder with: per-client Jackson + observation + your filters. */
     @Bean
     @LoadBalanced
-    public WebClient.Builder loadBalancedWebClientBuilder(ReactorClientHttpConnector connector,
+    public WebClient.Builder loadBalancedWebClientBuilder(@Qualifier("defaultConnector") ReactorClientHttpConnector connector,
                                                           Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
                                                           ObservationRegistry observationRegistry,
                                                           ClientRequestObservationConvention webClientObservationConvention,
@@ -282,7 +305,11 @@ public class ApplicationBeanConfiguration {
                     c.defaultCodecs().jackson2JsonEncoder(encoder);
                     c.defaultCodecs().jackson2JsonDecoder(decoder);
                     // (optional) increase if you parse large payloads
-                    // c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024);
+                    // ─────────────────────────────────────────────────────────────
+                    // NEW: keep codec buffering small so uploads don’t blow memory.
+                    // This limits (de)serialization buffers; it does NOT limit streaming bodies.
+                    // ─────────────────────────────────────────────────────────────
+                    c.defaultCodecs().maxInMemorySize(256 * 1024); // 256 KB
                 })
                 .filters(list -> {
 
@@ -316,4 +343,31 @@ public class ApplicationBeanConfiguration {
                 .build()
                 .createClient(HttpClientInterface.class);
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // NEW: A dedicated WebClient for huge uploads, using the “upload” connector.
+    // We manually add the LB filter so this client still resolves http://backend-service/.
+    // ──────────────────────────────────────────────────────────────────────────
+    @Bean
+    @Qualifier("uploadWebClient")
+    public WebClient uploadWebClient(
+            WebClient.Builder lbBuilder, // <-- this is the @LoadBalanced builder
+            @Qualifier("uploadConnector") ReactorClientHttpConnector uploadConnector,
+            ObservationRegistry observationRegistry,
+            ClientRequestObservationConvention webClientObservationConvention,
+            DserviceClientProperties props) {
+
+        return lbBuilder
+                .clone()
+                .clientConnector(uploadConnector)
+                .baseUrl("http://" + props.getServiceId()) // or "lb://" + props.getServiceId()
+                // DO NOT add the LB filter again here
+                .observationRegistry(observationRegistry)
+                .observationConvention(webClientObservationConvention)
+                .build();
+    }
+
+
+
+
 }

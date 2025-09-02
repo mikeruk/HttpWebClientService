@@ -5,6 +5,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.service.annotation.GetExchange;
 import org.springframework.web.service.annotation.HttpExchange;
 import org.springframework.web.service.annotation.PostExchange;
@@ -50,4 +51,19 @@ public interface HttpClientInterface {
     Mono<ResponseEntity<UserDTO>> getByIdWithHints(
             @PathVariable Long id,
             @RequestHeader Map<String, String> headers);
+
+
+    @PostExchange(
+            url         = "/upload-small-file",
+            contentType = MediaType.APPLICATION_OCTET_STREAM_VALUE,
+            accept      = MediaType.APPLICATION_OCTET_STREAM_VALUE
+    )
+    Mono<ResponseEntity<Void>> uploadSmallFile(@RequestBody Resource file);
+
+
+    @PostExchange(
+            url = "/upload-mp",
+            contentType = MediaType.MULTIPART_FORM_DATA_VALUE
+    )
+    Mono<ResponseEntity<Void>> uploadMultipart(@RequestPart("file") Resource file);
 }

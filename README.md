@@ -12,6 +12,11 @@
 
 NB!!! By design the WebClient is fully asynchronous (none-blocking) client!
 
+NB!!! WebClient is from reactive stack. When Uploading files towards backend-service, which is not built
+on reactive stack - the back-end service controllers must be adapted.
+OR best approach would be to create backend-service with reactive stack too! - Maybe as separate 
+module!
+
 NB!!!
 Making an individual call asynchronous (“imperative style”)
 If you ever need to call the client inside a blocking component (e.g. a scheduled @Component 
@@ -3392,12 +3397,724 @@ implementation 'com.github.ben-manes.caffeine:caffeine'
 
 
 
+               START of experiment to customize the WebClient -  10. Uploading Large Files: Tune Buffer Size / Memory Limits
+
 
 
 
 10. Uploading Large Files: Tune Buffer Size / Memory Limits
     If you need to send or receive large payloads (e.g. >10 MB), the default in-memory buffering may not suffice. You might want to raise
     the max in-memory size or switch to streaming chunks.
+
+The files which are uploaded can be of different size - small, medium and big, e.g. 2TB. Depending on the file size
+there can be different file-upload methods suitable.
+
+
+        Mental model:
+
+- Small bodies (≤ ~10 MB)
+  Simple encoders are fine. You can pass byte[], String, or a Resource. Memory impact is modest.
+
+- Medium bodies (~10 MB – few GB)
+  Still use Resource or multipart/form-data (if the server expects a form). Avoid accumulating the whole payload; let WebClient stream from disk.
+
+- Huge bodies (tens of GB → TB)
+  You must stream from disk (NIO) as a Flux<DataBuffer> and send chunked or with a known Content-Length. Disable/raise write-idle timeouts for this path. Don’t retry POST, and use a bulkhead so uploads don’t starve everything else.
+
+- Codec memory limit (maxInMemorySize)
+  This controls how much of a body is buffered for (de)serialization. Keep it low for uploads (responses are small), and use pure streaming for the request body so you never hold the whole file in RAM.
+
+
+    Code: builder tweaks + three upload strategies
+
+Below I keep existing code/comments and only add what’s new, clearly marked.
+
+1) ApplicationBeanConfiguration – add an “upload” connector, set codec limit, and a helper upload WebClient
+
+Here is the updated content of the ApplicationBeanConfiguration class:
+```java
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    private final DserviceClientProperties props;
+
+    // Constructor injection of our properties holder
+    public ApplicationBeanConfiguration(DserviceClientProperties props) {
+        this.props = props;
+    }
+
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean("defaultConnector")
+    ReactorClientHttpConnector clientHttpConnector()
+    {
+        HttpClient http = HttpClient.create()
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+
+                // RESPONSE timeout (time from request write until first response byte/headers)
+                .responseTimeout(Duration.ofSeconds(100))
+
+                // READ/WRITE inactivity timeouts (no bytes read/written for N seconds)
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))   // read idle
+                        .addHandlerLast(new WriteTimeoutHandler(10))  // write idle
+                )
+                // (Optional) enable Reactor Netty client I/O metrics (Micrometer-backed) at the socket level:
+                .metrics(true, uri -> uri); // <— use this public overload;
+
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // NEW: a more tolerant connector specifically for VERY large uploads.
+    //  - no write-idle timeout (or set it very high)
+    //  - longer overall response timeout
+    // Keep your general connector strict for normal traffic.
+    // ──────────────────────────────────────────────────────────────────────────
+    @Bean("uploadConnector")
+    ReactorClientHttpConnector uploadClientHttpConnector() {
+        HttpClient http = HttpClient.create()
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
+                .responseTimeout(Duration.ofHours(24)) // uploads can be LONG
+                .doOnConnected(conn -> conn
+                        // Disable write-idle timeout for streaming TBs
+                        .addHandlerLast(new ReadTimeoutHandler(0))   // 0 = disabled
+                        .addHandlerLast(new WriteTimeoutHandler(0))
+                )
+                .metrics(true, uri -> uri);
+        return new ReactorClientHttpConnector(http);
+    }
+
+
+    /** Optional: system-wide meter filters (apply to all registries). */
+    @Bean
+    MeterFilter commonTags() {
+        return MeterFilter.commonTags(Tags.of("app", "HttpWebClientService"));
+    }
+
+    /** Optional: configure percentiles/histograms for http client timers. */
+    @Bean
+    MeterFilter httpClientPercentiles() {
+        return new MeterFilter() {
+            @Override
+            public DistributionStatisticConfig configure(Meter.Id id, DistributionStatisticConfig config) {
+                if ("http.client.requests".equals(id.getName())) {
+                    return DistributionStatisticConfig.builder()
+                            .percentiles(0.5, 0.95, 0.99)
+                            .percentilesHistogram(true)
+                            .serviceLevelObjectives(
+                                    Duration.ofMillis(50).toNanos(),
+                                    Duration.ofMillis(100).toNanos(),
+                                    Duration.ofMillis(250).toNanos(),
+                                    Duration.ofMillis(500).toNanos(),
+                                    Duration.ofSeconds(1).toNanos()
+                            )
+                            .build()
+                            .merge(config); // keep existing settings + yours
+                }
+                return config; // leave others unchanged
+            }
+        };
+    }
+
+    /** A custom observation convention to add low-cardinality tags (e.g., serviceId, apiVersion). */
+    @Bean
+    ClientRequestObservationConvention webClientObservationConvention()
+    {
+        return new DefaultClientRequestObservationConvention()
+        {
+            @Override
+            public String getName()
+            {
+                // keep default meter name "http.client.requests"
+                return super.getName();
+            }
+
+            @Override
+            public KeyValues getLowCardinalityKeyValues(ClientRequestObservationContext context)
+            {
+                KeyValues defaults = super.getLowCardinalityKeyValues(context);
+                String serviceId = props.getServiceId(); // e.g. "backend-service"
+                String apiVersion = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst("X-API-Version") : null;
+                String corr = context.getRequest() != null
+                        ? context.getRequest().headers().getFirst(Correlation.HEADER) : null;
+
+                return defaults.and(
+                        KeyValue.of("service.id", serviceId == null ? "unknown" : serviceId),
+                        KeyValue.of("api.version", apiVersion == null ? "none" : apiVersion),
+                        KeyValue.of("corr.present", corr == null ? "no" : "yes")
+                );
+            }
+        };
+    }
+
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Resilience4j registries with code-based configuration (no YAML)
+    // ──────────────────────────────────────────────────────────────────────────
+    @Bean
+    CircuitBreakerRegistry circuitBreakerRegistry() {
+        CircuitBreakerConfig cbConfig = CircuitBreakerConfig.custom()
+                .failureRateThreshold(50f)                       // open CB if ≥50% of calls fail
+                .slowCallRateThreshold(50f)                      // or ≥50% are "slow"
+                .slowCallDurationThreshold(Duration.ofSeconds(2))// calls slower than this are "slow"
+                .waitDurationInOpenState(Duration.ofSeconds(10)) // stay OPEN for 10s
+                .permittedNumberOfCallsInHalfOpenState(5)        // trial calls when HALF_OPEN
+                .minimumNumberOfCalls(10)                        // don’t judge until we have 10 samples
+                .slidingWindowSize(50)                           // last 50 calls
+                .recordException(t -> {
+                    if (t instanceof ApiException api) {
+                        Integer s = api.getStatus();
+                        // don't trip on 4xx; do trip on 5xx/429
+                        return s == null || s >= 500 || s == 429;
+                    }
+                    return true; // timeouts/connect/etc.
+                })  // don’t count 4xx client errors
+                .build();
+        return CircuitBreakerRegistry.of(cbConfig);
+    }
+
+    // Decide which exceptions should open the breaker.
+    private boolean recordForCircuitBreaker(Throwable t)
+    {
+        // Treat 4xx as "business" outcomes: do NOT open CB for them.
+        if (t instanceof ApiException api) {
+            Integer s = api.getStatus();
+            if (s != null && s >= 400 && s < 500) {
+                return false; // 4xx don’t trip the breaker
+            }
+            // 5xx/429 should trip
+            return true;
+        }
+        // Transport/timeouts should trip
+        return true;
+    }
+
+    @Bean
+    BulkheadRegistry bulkheadRegistry() {
+        BulkheadConfig bhConfig = BulkheadConfig.custom()
+                .maxConcurrentCalls(50)              // cap concurrent in-flight calls
+                .maxWaitDuration(Duration.ofMillis(0)) // fail-fast when saturated
+                .build();
+        return BulkheadRegistry.of(bhConfig);
+    }
+
+
+    @Bean  // <<< OPTIONAL (code-based client zone)
+    public LoadBalancerZoneConfig loadBalancerZoneConfig() {
+        return new LoadBalancerZoneConfig("eu-west-1a"); // set YOUR client zone here
+    }
+
+    /**
+     * A builder that applies the LoadBalancerExchangeFilterFunction
+     * so URIs like http://backend-service are resolved via Eureka.
+     */
+    /**
+     * Load-balanced builder so "http://backend-service" resolves via Eureka.
+     * We plug our connector in here—no YAML required.
+     */
+    /** Load-balanced builder with: per-client Jackson + observation + your filters. */
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(@Qualifier("defaultConnector") ReactorClientHttpConnector connector,
+                                                          Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
+                                                          ObservationRegistry observationRegistry,
+                                                          ClientRequestObservationConvention webClientObservationConvention,
+                                                          CircuitBreakerRegistry circuitBreakerRegistry,
+                                                          BulkheadRegistry bulkheadRegistry)
+    {
+
+        // Per-client, Spring-aware mappers:
+        // 1) Build a Spring-aware base mapper (modules & features that Boot would normally register)
+        //    IMPORTANT: we do NOT modify the builder bean itself; we just call .build() to get an ObjectMapper.
+        ObjectMapper base = jackson2ObjectMapperBuilder.build();
+
+        // 2) Create separate enc/dec mappers so we can keep encode strict and decode lenient
+        ObjectMapper encoderMapper = base.copy()
+                // encode as ISO-8601 (no timestamps)
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                // don't serialize nulls (optional)
+                .setSerializationInclusion(JsonInclude.Include.NON_NULL);
+        // If your upstream is snake_case ONLY for this client, uncomment:
+        // .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+
+        ObjectMapper decoderMapper = base.copy()
+                // decode as ISO-8601 and be LENIENT to unknown fields from the upstream
+                .configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+        // 3) Support application/json and application/*+json
+        List<MediaType> jsonTypes = List.of(
+                MediaType.APPLICATION_JSON,
+                MediaType.valueOf("application/*+json")
+        );
+
+        Jackson2JsonEncoder encoder = new Jackson2JsonEncoder(
+                encoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+        Jackson2JsonDecoder decoder = new Jackson2JsonDecoder(
+                decoderMapper,
+                MediaType.APPLICATION_JSON,
+                MediaType.parseMediaType("application/*+json") // or new MimeType("application", "*+json") as alternative to MediaType.parseMediaType("application/*+json")
+        );
+
+
+
+
+
+        // Attach the retry filter here so every client built from this builder gets it.
+        var retryFilter = new RetryBackoffFilter(2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+        var errorMapping = new ErrorMappingFilter();
+        var correlationFilter = new CorrelationHeaderFilter();
+        var authFilter = new AuthHeaderFilter(props::getAuthToken);
+
+        // NEW: CircuitBreaker + Bulkhead filter.
+        // Name the CB/Bulkhead after the Eureka serviceId so all calls to that service share the same protections.
+        var r4jFilter = new Resilience4jFilter(
+                circuitBreakerRegistry,
+                bulkheadRegistry,
+                req -> props.getServiceId() // e.g. "backend-service"
+                // Alternative per-endpoint naming:
+                // req -> req.method().name() + " " + req.url().getPath()
+        );
+
+        // Build the LB-aware WebClient.Builder with custom per-client codecs
+        return WebClient.builder()
+                .clientConnector(connector)
+                // <<< this enables WebClient Observations/metrics
+                .observationRegistry(observationRegistry)
+                .observationConvention(webClientObservationConvention)
+                .codecs(c -> {
+                    c.defaultCodecs().jackson2JsonEncoder(encoder);
+                    c.defaultCodecs().jackson2JsonDecoder(decoder);
+                    // (optional) increase if you parse large payloads
+                    // ─────────────────────────────────────────────────────────────
+                    // NEW: keep codec buffering small so uploads don’t blow memory.
+                    // This limits (de)serialization buffers; it does NOT limit streaming bodies.
+                    // ─────────────────────────────────────────────────────────────
+                    c.defaultCodecs().maxInMemorySize(256 * 1024); // 256 KB
+                })
+                .filters(list -> {
+
+                    // We want the CircuitBreaker/Bulkhead to wrap EVERYTHING (including retry + error mapping),
+                    // and we want retry to happen INSIDE the breaker (so one logical call is counted once).
+                    // So we insert r4jFilter at index 0 (OUTERMOST).
+                    list.add(0, r4jFilter);          // <-- NEW (outermost)
+
+                    // OUTERMOST (was) -> now second outermost(now the r4jFilter is OUTERMOST)
+                    list.add(errorMapping);
+
+                    // request-mutating filters should run BEFORE retry (so each retry has headers)
+                    // mutate requests, then allow retry to re-run with headers
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+
+                    // INNER
+                    list.add(retryFilter);
+                });
+    }
+
+    @Bean
+    public HttpClientInterface userHttpInterface(WebClient.Builder builder) {
+        String host = "http://" + props.getServiceId();  // e.g. http://backend-service
+        WebClient webClient = builder
+                .baseUrl(host)
+                .build();
+
+        return HttpServiceProxyFactory
+                .builderFor(WebClientAdapter.create(webClient))
+                .build()
+                .createClient(HttpClientInterface.class);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // NEW: A dedicated WebClient for huge uploads, using the “upload” connector.
+    // We manually add the LB filter so this client still resolves http://backend-service/.
+    // ──────────────────────────────────────────────────────────────────────────
+    @Bean
+    @Qualifier("uploadWebClient")
+    public WebClient uploadWebClient(
+            WebClient.Builder lbBuilder, // <-- this is the @LoadBalanced builder
+            @Qualifier("uploadConnector") ReactorClientHttpConnector uploadConnector,
+            ObservationRegistry observationRegistry,
+            ClientRequestObservationConvention webClientObservationConvention,
+            DserviceClientProperties props) {
+
+        return lbBuilder
+                .clone()
+                .clientConnector(uploadConnector)
+                .baseUrl("http://" + props.getServiceId()) // or "lb://" + props.getServiceId()
+                // DO NOT add the LB filter again here
+                .observationRegistry(observationRegistry)
+                .observationConvention(webClientObservationConvention)
+                .build();
+    }
+
+
+}
+
+```
+If Builder.clone() isn’t available in your Spring version, construct the uploadWebClient similarly to your main 
+builder (re-apply filters and codecs) and add lbFilter manually so http://backend-service still resolves via Eureka.
+
+2) HTTP interface – I already have method for upload there ,but I will create a new one like so:
+This one will be used for small file sizes. 
+```java
+@PostExchange(
+        url         = "/upload-small-file",
+        contentType = MediaType.APPLICATION_OCTET_STREAM_VALUE,
+        accept      = MediaType.APPLICATION_OCTET_STREAM_VALUE
+)
+Mono<ResponseEntity<Void>> uploadSmallFile(@RequestBody Resource file);
+```
+Optionally add a multipart form endpoint if your server expects multipart/form-data:
+```java
+@PostExchange(
+    url = "/upload-mp",
+    contentType = MediaType.MULTIPART_FORM_DATA_VALUE
+)
+Mono<ResponseEntity<Void>> uploadMultipart(@RequestPart("file") Resource file);
+
+```
+Tip: keeping both gives you flexibility to choose the best strategy per file size.
+
+3) A dedicated service class LargeFileUploadService with three strategies
+
+```java
+package reactive.httpwebclientservice.services;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.MultipartBodyBuilder;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactive.httpwebclientservice.HttpClientInterface;
+import reactive.httpwebclientservice.config.DserviceClientProperties;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+@Service
+public class LargeFileUploadService {
+
+    private final HttpClientInterface http;           // for small/medium convenience
+    private final WebClient uploadClient;             // for huge streaming
+    private final WebClient.Builder lbBuilder;        // if you need ad-hoc tweaks
+    private final String base;                        // http://backend-service
+
+    public LargeFileUploadService(HttpClientInterface http,
+                                  @Qualifier("uploadWebClient") WebClient uploadClient,
+                                  WebClient.Builder lbBuilder,
+                                  DserviceClientProperties props) {
+        this.http = http;
+        this.uploadClient = uploadClient;
+        this.lbBuilder = lbBuilder;
+        this.base = "http://" + props.getServiceId();
+    }
+
+    /** Strategy A — small files (≤ ~10 MB): simplest; uses the Http Interface with a Resource. */
+    public Mono<ResponseEntity<Void>> uploadSmall(Path path) {
+        FileSystemResource res = new FileSystemResource(path);
+        return http.uploadSmallFile(res);
+    }
+
+    /** Strategy B — medium files (10 MB – multi-GB): multipart/form-data, still streams from disk. */
+    public Mono<ResponseEntity<Void>> uploadMultipart(Path path) {
+        FileSystemResource res = new FileSystemResource(path);
+        return http.uploadMultipart(res);   // <-- use your HttpClientInterface method
+    }
+
+    /** Strategy C — HUGE files (hundreds of GB → TB): pure streaming via DataBuffer Flux, chunked or content-length. */
+    public Mono<ResponseEntity<Void>> uploadStreaming(Path path) throws IOException {
+        // quick sanity check to avoid 500 on missing path
+        if (!Files.exists(path)) {
+            return Mono.error(new IllegalArgumentException("File not found: " + path));
+        }
+
+        int chunkSize = 64 * 1024; // 64 KB; tune if needed
+
+        Flux<DataBuffer> body = DataBufferUtils
+                .read(path, new DefaultDataBufferFactory(), chunkSize)
+                .doOnDiscard(DataBuffer.class, DataBufferUtils::release);
+
+        return uploadClient
+                .post()
+                .uri("/api/v1/upload-large-files")         // RELATIVE uri (baseUrl already set)
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                // omit Content-Length → Transfer-Encoding: chunked
+                .body(BodyInserters.fromDataBuffers(body))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+}
+
+```
+Notes:
+- FileSystemResource is already streaming; it does not load the whole file in memory.
+- For huge streaming we bypass Jackson entirely—no encoding involved, just raw bytes as DataBuffers.
+- If your server requires Content-Length, set it via Files.size(path); otherwise chunked is fine.
+- Never keep your general write-idle timeout low for TB uploads—use the upload connector.
+
+
+4) Controller: let the user caller pick a strategy (for testing)
+
+```java
+@RestController
+@RequestMapping("/proxy")
+public class UploadProxyController {
+
+    private final LargeFileUploadService service;
+
+    public UploadProxyController(LargeFileUploadService service) {
+        this.service = service;
+    }
+
+    @PostMapping("/upload-small")
+    public Mono<ResponseEntity<Void>> upSmall(@RequestParam("path") String path) {
+        return service.uploadSmall(Path.of(path));
+    }
+
+    @PostMapping("/upload-mp")
+    public Mono<ResponseEntity<Void>> upMultipart(@RequestParam("path") String path) {
+        return service.uploadMultipart(Path.of(path));
+    }
+
+    @PostMapping("/upload-stream")
+    public Mono<ResponseEntity<Void>> upStream(@RequestParam("path") String path) throws IOException {
+        return service.uploadStreaming(Path.of(path));
+    }
+}
+
+
+```
+Next, before we send test requests with Postman client, we need to create new files and simulate that they are
+with small, medium and very big size:
+Create sparse files (Linux):    
+Avoid copying/moving them to other locations. It requires special flags when copying.
+Best is to delete the files after finish testing.
+```bash
+# Small ~10 MB (sparse)
+truncate -s 10M ~/small.bin
+
+# Medium ~2 GB (sparse)
+truncate -s 2G  ~/medium.bin
+
+# Huge ~2 TB (sparse)
+truncate -s 2T  ~/huge.bin
+
+```
+I created and located such test files in the Documents folder - will provide the absolute path to file.
+
+
+Verify they don’t take space on the disk:
+```bash
+ls -lh ~/small.bin ~/medium.bin ~/huge.bin   # logical sizes (10M / 2G / 2T)
+du -h  ~/small.bin ~/medium.bin ~/huge.bin   # actual disk usage (should be ~0)
+
+```
+Notes:
+- Reading a sparse file returns zeros for the “holes”, so your upload will stream zeros—good enough to stress 
+    timeouts, throughput, and memory.
+- Don’t use fallocate -l for this; it preallocates blocks (consumes space). Stick to truncate/dd seek.
+- If you ever copy them, preserve sparseness: cp --sparse=always src dst or rsync -S src dst.
+
+
+Now you can test with Postman:
+
+Small: POST http://localhost:8080/proxy/upload-small?path=/absolute/path/to/file.bin
+For testing with smallFileSizes coming from Reactive stack, the backend service needs to process
+which files request properly. NB! backend-service is build on MVC, which is not reactive stack. Therefore
+backend and its controller in particular must be adapted to communicate with reactive stack. Create a
+controller in the other project - dservice (backend-service) like so:
+```java
+@RestController
+@RequestMapping("/api/v1")
+public class UploadController {
+
+    @PostMapping(value = "/upload-small-file", consumes = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    public ResponseEntity<Void> upload(HttpServletRequest request) throws IOException {
+        try (InputStream in = request.getInputStream();
+             OutputStream out = OutputStream.nullOutputStream()) { // <-- discards data
+            long bytes = in.transferTo(out);  // streams everything; writes nowhere
+            // log if you want: System.out.println("Received bytes = " + bytes);
+        }
+        return ResponseEntity.accepted().build();
+    }
+}
+
+```
+Now when you send POST http://localhost:8080/proxy/upload-small?path=/absolute/path/to/file.bin 
+works with success! The Postman client receives 202 ACCEPTED!
+
+Note:
+(In real life, you’d pass the file itself as multipart from Postman; this endpoint accepts a local path just to exercise WebClient behaviors end-to-end.)
+
+
+Next, test with:
+Medium: POST http://localhost:8080/proxy/upload-mp?path=/absolute/path/to/file.bin
+The backend-service does not have controller to accept multipart fileuploads, so create one
+on the project dservice (backend-service), like so:
+```java
+/**
+ * Multipart receiver for medium-sized uploads.
+ * Matches your WebClient interface:
+ *
+ *   @PostExchange(url="/upload-mp", contentType=MediaType.MULTIPART_FORM_DATA_VALUE)
+ *   Mono<ResponseEntity<Void>> uploadMultipart(@RequestPart("file") Resource file);
+ *
+ * The part name **must** be "file".
+ */
+@PostMapping(value = "/upload-mp", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public ResponseEntity<Void> uploadMultipart(@RequestPart("file") MultipartFile file) throws IOException {
+    // Discard bytes to avoid storing anything (safe for testing)
+    try (InputStream in = file.getInputStream();
+         OutputStream out = OutputStream.nullOutputStream()) {
+        in.transferTo(out);
+    }
+    return ResponseEntity.accepted().build();
+}
+```
+Now when you send the request via postman it works with success! 202 Accepted is respocnse 
+received in Postman client.
+
+Next, test with:
+Huge: POST http://localhost:8080/proxy/upload-stream?path=/absolute/path/to/file.bin
+Make sure the other project - dservice (backend-service) has this controller:
+```java
+/**
+     * (Optional) Your raw octet-stream endpoint from earlier — kept here for completeness.
+     * Streams request body without buffering to disk.
+     */
+    @PostMapping(value = "/upload-large-files", consumes = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    public ResponseEntity<Void> uploadOctet(HttpServletRequest request) throws IOException {
+        try (InputStream in = request.getInputStream();
+             OutputStream out = OutputStream.nullOutputStream()) {
+            in.transferTo(out);
+        }
+        return ResponseEntity.accepted().build();
+    }
+
+```
+It will successfully receive the incoming request. With file sizes > 10G there is no problem,
+But when I send filesize 2T - the method successfully started executing this code line here:
+```text
+in.transferTo(out);
+```
+but after a while the Postman received reply 503 Service unavailable:
+```text
+{
+    "timestamp": "2025-09-02T10:54:19.143+00:00",
+    "status": 503,
+    "error": "Service Unavailable",
+    "path": "/proxy/upload-stream"
+}
+```
+,and the webclient service logs this on the console:
+```text
+
+[HttpWebClientService] [nio-8080-exec-3] .w.s.m.s.DefaultHandlerExceptionResolver : Resolved [org.springframework.web.context.request.async.AsyncRequestTimeoutException]
+
+```
+Why does this timeout happen?
+I’ve hit the Servlet async timeout on your WebClient app (it’s running on Tomcat / Spring MVC, not Netty).
+When a controller method takes longer than the MVC async timeout, Spring throws AsyncRequestTimeoutException,
+and the default resolver returns 503—exactly what you saw.
+The 2 TB stream is fine on the client side (we already removed write-idle and raised the 
+Reactor client timeouts for uploadWebClient). The server side (your WebClient app acting as 
+an HTTP server for Postman) is what’s timing out.
+
+Here is how this can be fixed: - BUT I WILL NOT implement any of these fixes now. Its just good to know:
+
+The fixes are to be implemented in the WebClient service (the app receiving Postman’s request).
+That’s where the AsyncRequestTimeoutException is thrown by Spring MVC.        
+
+        Fix (programmatic, no YAML):
+Add a small MVC config to raise (or disable) the async timeout:
+```java
+// e.g., in ApplicationBeanConfiguration (or any @Configuration class)
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.AsyncSupportConfigurer;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+import java.time.Duration;
+
+@Configuration
+public class MvcAsyncConfig implements WebMvcConfigurer {
+
+    @Override
+    public void configureAsyncSupport(AsyncSupportConfigurer configurer) {
+        // Set to a very large value for huge uploads, or 0 for "no timeout".
+        configurer.setDefaultTimeout(Duration.ofHours(12).toMillis()); // or 0L for unlimited
+        // Optionally choose a dedicated executor:
+        // configurer.setTaskExecutor(yourThreadPoolTaskExecutor);
+    }
+}
+
+
+```
+That controls how long Spring MVC will keep the request “open” while your reactive pipeline is working.
+
+
+(Optional FIX) Property-based equivalent
+If you don’t mind YAML/properties, the same can be done with:
+```yml
+spring:
+  mvc:
+    async:
+      request-timeout: 12h   # or 0 for no timeout
+
+```
+Double-check other timeouts
+
+Postman timeout: ensure it isn’t cutting off the client early.
+Reverse proxies (Nginx/Apache) if present: raise proxy_read_timeout/RequestReadTimeout, etc.
+Backend service: you already accept raw octet-stream and simply transferTo(out), which is fine.
+After raising the MVC async timeout, your /proxy/upload-stream should no longer 503 on multi-hour transfers.
+But I have not really tested it!
+
+Open remains the idea to create one URL entry point like: "/upload-all-filesize" which to accept all
+possible file sizes and based on the size to call one of the existing methods - for small, for medium
+and for huge filesizes.
+
+
+
+
+
+
+
+               START of experiment to customize the WebClient -  10. Uploading Large Files: Tune Buffer Size / Memory Limits
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 11. Proxy or Custom SSL (TrustStore) Configuration
     In corporate environments, you sometimes have to route outgoing HTTP calls through an HTTP proxy (say, corporate-proxy:8080).
