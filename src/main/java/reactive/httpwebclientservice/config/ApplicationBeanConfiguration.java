@@ -298,6 +298,9 @@ public class ApplicationBeanConfiguration {
         // after you build other filters:
         var loggingFilter = new HttpLoggingFilter(64 * 1024); // log up to 64KB of response body
 
+        var cookieFilter = new reactive.httpwebclientservice.filters.CookieExchangeFilter(stickyCookieStore());
+
+
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
@@ -330,6 +333,10 @@ public class ApplicationBeanConfiguration {
                     // mutate requests, then allow retry to re-run with headers
                     list.add(correlationFilter);
                     list.add(authFilter);
+
+                    // ⬇️ add cookies here so mutations above are already applied;
+                    // and retries below will include cookies on each attempt
+                    list.add(cookieFilter);
 
                     // INNER
                     list.add(retryFilter);
@@ -373,6 +380,11 @@ public class ApplicationBeanConfiguration {
     }
 
 
+    // NEW: a singleton cookie store (per application)
+    @Bean
+    public reactive.httpwebclientservice.cookies.StickyCookieStore stickyCookieStore() {
+        return new reactive.httpwebclientservice.cookies.StickyCookieStore();
+    }
 
 
 }

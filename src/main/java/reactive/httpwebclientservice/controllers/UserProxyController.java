@@ -130,4 +130,14 @@ public class UserProxyController {
     }
 
 
+    @GetMapping("/cookie/set")
+    public Mono<ResponseEntity<String>> proxyCookieSet() {
+        return users.cookieSet();
+    }
+
+    @GetMapping("/cookie/need")
+    public Mono<ResponseEntity<String>> proxyCookieNeed() {
+        return users.cookieNeed();
+    }
+
 }

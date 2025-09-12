@@ -66,4 +66,11 @@ public interface HttpClientInterface {
             contentType = MediaType.MULTIPART_FORM_DATA_VALUE
     )
     Mono<ResponseEntity<Void>> uploadMultipart(@RequestPart("file") Resource file);
+
+
+    @GetExchange("/cookie/set")
+    Mono<ResponseEntity<String>> cookieSet();
+
+    @GetExchange("/cookie/need")
+    Mono<ResponseEntity<String>> cookieNeed();
 }
