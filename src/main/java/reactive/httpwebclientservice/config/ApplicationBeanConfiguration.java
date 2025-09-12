@@ -295,6 +295,9 @@ public class ApplicationBeanConfiguration {
                 // req -> req.method().name() + " " + req.url().getPath()
         );
 
+        // after you build other filters:
+        var loggingFilter = new HttpLoggingFilter(64 * 1024); // log up to 64KB of response body
+
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
@@ -312,7 +315,9 @@ public class ApplicationBeanConfiguration {
                     c.defaultCodecs().maxInMemorySize(256 * 1024); // 256 KB
                 })
                 .filters(list -> {
-
+                    // Put logging fairly outer so you see what's retried, but AFTER request-mutation,
+                    // so headers (auth/correlation) appear in logs.
+                    list.add(loggingFilter);
                     // We want the CircuitBreaker/Bulkhead to wrap EVERYTHING (including retry + error mapping),
                     // and we want retry to happen INSIDE the breaker (so one logical call is counted once).
                     // So we insert r4jFilter at index 0 (OUTERMOST).

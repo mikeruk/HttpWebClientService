@@ -36,4 +36,8 @@ logging:
     org.springframework.cloud.client.loadbalancer: DEBUG
     org.springframework.cloud.loadbalancer: DEBUG
     org.springframework.cloud.loadbalancer.core: DEBUG
+    http.trace: DEBUG    # per-request (X-Debug-Log=true) logs go here
+    reactive.httpwebclientservice.filters.HttpLoggingFilter: DEBUG
+    reactor.netty.http.client.HttpClient: DEBUG # optional raw byte wiretap (Netty):
+
 

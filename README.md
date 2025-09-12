@@ -4098,30 +4098,398 @@ and for huge filesizes.
 
 
 
-               START of experiment to customize the WebClient -  10. Uploading Large Files: Tune Buffer Size / Memory Limits
+               END of experiment to customize the WebClient -  10. Uploading Large Files: Tune Buffer Size / Memory Limits
 
 
 
 
 
+               START of experiment to customize the WebClient - 11. Proxy or Custom SSL (TrustStore) Configuration
 
 
+This task WILL NOT BE implemented now. Here just a common knowledge base and explanations:
 
-
-
-
-
-
-
-
-
-
-11. Proxy or Custom SSL (TrustStore) Configuration
+11. Proxy or Custom SSL (TrustStore) Configuration:
     In corporate environments, you sometimes have to route outgoing HTTP calls through an HTTP proxy (say, corporate-proxy:8080).
+
+
+        Proxy or Custom SSL (TrustStore)
+Related but separate concerns:
+- HTTP/S Proxy: a middleman your client must go through to reach the internet/intranet (e.g., corporate-proxy:8080). 
+For HTTPS, the client usually does a CONNECT tunnel via the proxy. Proxies can also TLS-inspect traffic (MITM), 
+in which case they re-sign server certs with a corporate root CA you must trust.
+- 
+- Custom SSL / TrustStore: controls what CAs/certs your client trusts (and optionally your client cert for mTLS). 
+You use this when calling:
+1) internal servers with private CAs or self-signed certs, or
+2) a TLS-inspecting corporate proxy (you must trust the proxy’s root CA).
+
+- Certbot: a server-side tool to obtain public TLS certs from Let’s Encrypt. It’s not needed to call services with WebClient. You’d use it only if you operate the backend and want a valid public cert.
+
+
+Here’s a compact mental model that makes TLS and certificates click.
+
+          What TLS is for (the goals)
+When your client talks to a server over HTTPS (TLS), it wants three things:
+
+- Confidentiality – nobody can read the traffic.
+
+- Integrity – nobody can tamper with it undetected.
+
+- Authenticity – you’re really talking to the server you intended (and, optionally, the server knows who you are).
+
+
+        How a TLS handshake works (high level)
+1. ClientHello: the client says “I support TLS vX, these cipher suites, SNI=host.com, ALPN=http/1.1 or h2…”.
+2. ServerHello + Certificate: server picks algorithms and sends its certificate chain (leaf cert for host.com plus one or more intermediates).
+3. Server authentication: client validates the server chain:
+   ◦ Each cert is signed by the next CA up to a trusted root in the client’s trust store.
+   ◦ The leaf cert’s SAN (Subject Alternative Name) includes the hostname (host.com).
+   ◦ Certs are within validity dates and not revoked (OCSP/CRL).
+4. Key exchange (e.g., ECDHE) → both derive symmetric keys.
+5. (Optional) Client authentication (mTLS): server asks for a client certificate; client sends its cert chain and proves it has the private key.
+6. Finished → app data flows encrypted.
+
+
+        Certificates & PKI in short explanation
+• A certificate binds a public key to an identity (a DNS name for servers; a person/service for clients).
+• A CA (Certificate Authority) signs certificates. Validation follows the chain: leaf → intermediate(s) → root.
+• Clients trust a set of root CAs (OS/JVM trust store). Anything chaining to those is accepted (if hostname/time match).
+• Self-signed or private CA certs aren’t trusted by default. You add the CA’s root cert to your trust store to trust them.
+
+        Server certs vs Client certs (mTLS)
+• Server certificate: proves the server’s identity to the client (HTTPS norm).
+• Client certificate: proves the client’s identity to the server (mutual TLS). Used inside enterprises, zero-trust meshes, etc.
+
+
+        Truststore vs Keystore (Java terms)
+• Truststore = “who I trust” → contains CA/root certificates (public). Used to verify the peer (server, or client in mTLS).
+• Keystore = “who I am” → contains your private key + your certificate chain. Used when you must present an identity (server TLS or client mTLS).
+Common formats: PKCS#12 (.p12/.pfx), JKS (Java), PEM (Base64). Convert with keytool/openssl.
+
+        Proxies and TLS
+• HTTP proxy for HTTPS (CONNECT tunnel): the proxy just tunnels bytes; TLS is end-to-end between client and server. No extra trust needed if server uses a public CA.
+• TLS-inspecting proxy (MITM): the proxy terminates TLS and re-issues a cert signed by the corporate root CA. Your client must trust that corporate root (add it to the truststore), or you’ll get cert errors.
+
+        Where Let’s Encrypt / certbot fits
+• Certbot is a server-side tool to obtain valid public server certificates via ACME.
+• You do not need certbot to call services with WebClient. You use it only if you operate the server and want a public TLS cert.
+
+
+        Practical mapping to Spring/WebClient
+• By default, WebClient (via JVM) trusts public CAs in $JAVA_HOME/lib/security/cacerts.
+• If calling an internal service or TLS-inspecting proxy:
+    ◦ Put the internal CA root into a truststore and point your client to it.
+• If the server requires mTLS:
+    ◦ Provide a keystore with your client cert + private key.
+• Hostname verification must match the SAN; don’t disable it except in controlled tests.
+• For HTTP/2, ALPN is negotiated automatically by modern stacks.
+
+        Common pitfalls & tips
+• Expired certs / wrong SAN → handshake fails.
+• Forgetting to include the intermediate CA on the server → clients fail to build the chain.
+• Mixing up keystore vs truststore.
+• Storing secrets (passwords) in code—prefer env/secret manager.
+• Use openssl s_client -connect host:443 -servername host.com to debug chains; curl --cacert corp-root.pem https://… to test trust.
+That’s the core. Once this model is clear, wiring a custom truststore (who you trust) and/or keystore (who you are) into your WebClient is just configuration.
+
+
+
+
+
+
+               END of experiment to customize the WebClient - 11. Proxy or Custom SSL (TrustStore) Configuration
+
+
+
+
+
+
+               START of experiment to customize the WebClient -  12. Request/Response Logging (Full Body + Headers)
+
+
 
 12. Request/Response Logging (Full Body + Headers)
     While debugging, you often want to log every outgoing request (method, URI, headers, body) and every incoming response
     (status, headers, body). Spring’s ExchangeFilterFunction can do this, without you sprinkling logs in every controller.
+
+logging.level in application.yml only turns up/down categories that already log something.
+WebClient (and Spring Cloud LB) don’t log request/response bodies by default, and they log only limited
+headers/lines. Cranking log level to DEBUG/TRACE won’t magically add body-logging because that behavior 
+isn’t implemented in those components.
+
+We already have Netty wiretap on the upload connector; now let’s add application-level 
+request/response logging (headers + body) via an ExchangeFilterFunction. This lets you see pretty 
+JSON/text, correlate with your correlation-id, and safely pass the response downstream.
+
+An ExchangeFilterFunction actually adds logging behavior at the WebClient layer.
+It intercepts the request/response, can pretty-print JSON, redact secrets, cap body size, sample by 
+header, and still pass the body downstream. That capability doesn’t exist out of the box—so you 
+implement it as a filter.
+
+Netty wiretap(true) vs filter:
+Wiretap logs raw bytes at the TCP level (hex dumps, very noisy, no redaction, no correlation-id 
+awareness). The filter logs application-level info (method/URI/headers/body) in a controlled, safe way.
+
+You can still control verbosity with logging.level.
+The filter uses a logger; logging.level.your.package.HttpLoggingFilter=INFO/DEBUG lets you toggle it 
+without code changes. But the ability to log bodies comes from the filter itself.
+
+Important note! - there is big difference between server-side WebFlux and client-side WebFlux. We are
+using WebClient and we use client-side functionality of WebFlux.
+
+Here’s a working, client-side logging filter that compiles with your deps. It logs method/URL/headers 
+and the response body (safely truncated), then rebuilds the response so downstream code can still 
+consume it. Request-body logging is intentionally skipped (it’s tricky to do generically without server 
+APIs); when you need raw request/response bytes, rely on Netty wiretap during debugging.
+
+
+1) Client logging filter (headers + response body, per-request toggle)
+
+```java
+
+package reactive.httpwebclientservice.filters;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferFactory;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.MediaType;
+import org.springframework.web.reactive.function.client.ClientRequest;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
+import org.springframework.web.reactive.function.client.ExchangeFunction;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+public final class HttpLoggingFilter implements ExchangeFilterFunction {
+
+    private static final Logger log = LoggerFactory.getLogger(HttpLoggingFilter.class);
+
+    private static final Set<String> REDACT = Set.of(
+            "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"
+    );
+
+    private final int maxBodyBytes;
+
+    public HttpLoggingFilter(int maxBodyBytes) {
+        this.maxBodyBytes = Math.max(0, maxBodyBytes);
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        boolean enabledForThisRequest = isEnabledByHeaderOrQuery(request);
+        boolean doLog = enabledForThisRequest || log.isDebugEnabled();
+
+        if (!doLog) {
+            // fast path
+            return next.exchange(request);
+        }
+
+        Logger target = enabledForThisRequest ? LoggerFactory.getLogger("http.trace") : log;
+
+        // ── Request line + headers (no body) ───────────────────────────────────
+        target.info("--> {} {}", request.method(), request.url());
+        request.headers().forEach((k, v) -> target.info("    {}: {}", k, redact(k, v)));
+
+        long start = System.nanoTime();
+
+        return next.exchange(request)
+                .flatMap(resp -> bufferAndLogResponse(resp, request, target, start))
+                .onErrorResume(err -> {
+                    target.info("<-- network error for {} {}: {}", request.method(), request.url(), err.toString());
+                    return Mono.error(err);
+                });
+    }
+
+    private Mono<ClientResponse> bufferAndLogResponse(ClientResponse resp,
+                                                      ClientRequest req,
+                                                      Logger target,
+                                                      long startNanos) {
+        DataBufferFactory factory = new DefaultDataBufferFactory();
+        MediaType ct = resp.headers().contentType().orElse(null);
+
+        boolean textual = ct != null && (
+                MediaType.APPLICATION_JSON.isCompatibleWith(ct) ||
+                        MediaType.TEXT_PLAIN.isCompatibleWith(ct) ||
+                        MediaType.APPLICATION_XML.isCompatibleWith(ct) ||
+                        MediaType.TEXT_XML.isCompatibleWith(ct) ||
+                        ct.getSubtype().endsWith("+json") ||
+                        ct.getSubtype().endsWith("+xml")
+        );
+
+        Mono<byte[]> bodyBytesMono = textual
+                ? resp.bodyToMono(byte[].class).defaultIfEmpty(new byte[0])
+                : Mono.just(new byte[0]);
+
+        return bodyBytesMono.flatMap(bytes -> {
+            long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            target.info("<-- {} {} ({} ms)", resp.statusCode().value(), req.url(), tookMs);
+            resp.headers().asHttpHeaders().forEach((k, v) -> target.info("    {}: {}", k, String.join(",", v)));
+
+            if (textual && bytes.length > 0) {
+                String preview = preview(bytes, maxBodyBytes);
+                target.info("⤷ body ({} bytes{})\n{}", bytes.length,
+                        bytes.length > maxBodyBytes ? ", truncated" : "", preview);
+            } else if (!textual) {
+                resp.headers().contentLength().ifPresentOrElse(
+                        len -> target.info("⤷ [binary body {} bytes; not logged]", len),
+                        ()  -> target.info("⤷ [binary body; length unknown; not logged]")
+                );
+            }
+
+            Flux<DataBuffer> bodyFlux = (textual && bytes.length > 0)
+                    ? Flux.just(factory.wrap(bytes))
+                    : resp.bodyToFlux(DataBuffer.class); // pass-through if we didn’t buffer
+
+            return Mono.just(resp.mutate().body(bodyFlux).build());
+        });
+    }
+
+    private static List<String> redact(String key, List<String> vals) {
+        return REDACT.contains(key.toLowerCase()) ? List.of("***") : vals;
+    }
+
+    private static String preview(byte[] bytes, int limit) {
+        int n = Math.min(bytes.length, limit);
+        String s = new String(bytes, 0, n, StandardCharsets.UTF_8);
+        return bytes.length > limit ? s + "\n…(truncated)" : s;
+    }
+
+    private static boolean isEnabledByHeaderOrQuery(ClientRequest req) {
+        // Header first
+        String hv = req.headers().getFirst("X-Debug-Log");
+        if (hv != null && hv.equalsIgnoreCase("true")) return true;
+
+        // Query param fallback
+        URI uri = req.url();
+        String q = uri.getQuery();
+        if (q == null || q.isBlank()) return false;
+        // crude parse: X-Debug-Log=true anywhere
+        for (String part : q.split("&")) {
+            String[] kv = part.split("=", 2);
+            if (kv.length == 2 && kv[0].equalsIgnoreCase("X-Debug-Log")
+                    && kv[1].equalsIgnoreCase("true")) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+
+
+
+```
+Why no request body?
+In a generic ExchangeFilterFunction you don’t reliably have the body bytes 
+(they can be a one-shot streaming Flux<DataBuffer>). Capturing them risks consuming/duplicating large 
+streams (e.g., TB uploads) and breaking backpressure. For full raw bodies, flip on Netty wiretap 
+temporarily.
+
+
+Add once to your existing loadBalancedWebClientBuilder(...):
+
+2) Register it (outer portion of your chain)
+
+```java
+// In the ApplicationBeanConfiguration file
+var loggingFilter = new HttpLoggingFilter(64 * 1024); // log up to 64 KB of response body
+
+return WebClient.builder()
+    .clientConnector(connector)
+    .observationRegistry(observationRegistry)
+    .observationConvention(webClientObservationConvention)
+    .codecs(c -> {
+        c.defaultCodecs().jackson2JsonEncoder(encoder);
+        c.defaultCodecs().jackson2JsonDecoder(decoder);
+        c.defaultCodecs().maxInMemorySize(256 * 1024);
+    })
+            .filters(list -> {
+        // Put logging after request-mutators so you see those headers,
+        // but still fairly outer so you can observe retries/resilience.
+        list.add(loggingFilter);
+
+        list.add(0, r4jFilter);
+        list.add(errorMapping);
+        list.add(correlationFilter);
+        list.add(authFilter);
+        list.add(retryFilter);
+    });
+
+
+```
+
+3) Minimal logging config
+
+```yaml
+logging:
+  level:
+    http.trace: DEBUG    # per-request (X-Debug-Log=true) logs go here
+    reactive.httpwebclientservice.filters.HttpLoggingFilter: DEBUG  # optional for always-on
+# For raw bytes (both directions), temporarily:
+#    reactor.netty.http.client.HttpClient: DEBUG
+
+```
+
+4) How to use / verify
+   Normal calls: no extra logs (unless you set the class logger to DEBUG).
+Per-request enable: in Postman add either
+header: X-Debug-Log: true, or
+query: ?X-Debug-Log=true
+
+You’ll now see lines like:
+```cpp
+--> GET http://backend-service/api/v1/user/5
+    Authorization: ***
+    X-Correlation-Id: 9dd2...
+<-- 200 http://backend-service/api/v1/user/5 (12 ms)
+    Content-Type: application/json
+⤷ body (512 bytes)
+{ ...truncated json... }
+
+
+```
+Bottom line:
+
+With this filter you now have request line + headers and response status + headers + body logging, 
+toggleable per-request.
+
+For full request body logging (including big streams), the safe/standard approach is Netty wiretap 
+(turn on only when debugging), because application-level duplication of arbitrary reactive bodies is
+not safe for large/streaming payloads.
+
+Why we added X-Debug-Log??
+It was just a safe-on-by-request demo toggle so you wouldn’t flood logs in prod. It’s convenient 
+during manual testing (“turn on verbose logging for this one call”) without changing log levels globally.
+The risk:
+Because the header is client-controlled, you shouldn’t depend on it for critical observability. 
+A “malicious” or simply unaware client won’t send it—so you’d miss logs if you rely on it exclusively.
+The preferred place to log it is on the server side.
+
+
+
+               END of experiment to customize the WebClient -  12. Request/Response Logging (Full Body + Headers)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 13. Dynamic Base URL Resolution (Non-Eureka Fallback)
     You currently use Eureka (serviceId = "backend-service") in your HttpClientInterface. But you might want a fallback to a fixed URL
