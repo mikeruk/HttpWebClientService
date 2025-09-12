@@ -4480,20 +4480,24 @@ The preferred place to log it is on the server side.
 
 
 
-
-
-
-
-
-
-
-
-
+               START of experiment to customize the WebClient -  13. Dynamic Base URL Resolution (Non-Eureka Fallback)
 
 
 13. Dynamic Base URL Resolution (Non-Eureka Fallback)
     You currently use Eureka (serviceId = "backend-service") in your HttpClientInterface. But you might want a fallback to a fixed URL
     if Eureka is down (or if the user configures some base-url in a properties file for testing).
+
+Unfortunately that task had no success, although the implementation was relative simple. Somehow the fallback
+did not work. To avoid messing up the order of the filters, I decided not to implement it, because changing
+the order of the filters will not signal me if I break some of the older tasks, I already implemented.
+
+
+               END of experiment to customize the WebClient -  13. Dynamic Base URL Resolution (Non-Eureka Fallback)
+
+
+
+
+
 
 14. Custom Cookie Management
     If your backend sets a session cookie (e.g. Set-Cookie: SESSION=abc123; Path=/; HttpOnly), you may need to send that cookie
