@@ -300,6 +300,10 @@ public class ApplicationBeanConfiguration {
 
         var cookieFilter = new reactive.httpwebclientservice.filters.CookieExchangeFilter(stickyCookieStore());
 
+        // add this near your other filter instantiations
+        var routeAwareFilter = new RouteAwareHeaderFilter(req -> "secret-default-token"); // or pull from props
+
+
 
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
@@ -337,7 +341,8 @@ public class ApplicationBeanConfiguration {
                     // ⬇️ add cookies here so mutations above are already applied;
                     // and retries below will include cookies on each attempt
                     list.add(cookieFilter);
-
+                    list.add(routeAwareFilter);   // <— NEW: conditional header logic lives with other mutators
+                    list.add(loggingFilter); // SECOND time added same logging filter, to ensure any mutated requests are alo logged
                     // INNER
                     list.add(retryFilter);
                 });

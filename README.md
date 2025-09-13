@@ -4882,10 +4882,7 @@ Certbot?
 
 
 
-
-
-
-
+                START of experiment to customize the WebClient -  17. Conditional Logic Based on Request Path or Headers
 
 
 
@@ -4893,6 +4890,175 @@ Certbot?
 17. Conditional Logic Based on Request Path or Headers
     Suppose you want different behavior when calling /user/{id} vs /user-with-data/{id}. For instance, maybe calls to /user-with-data/…
     must carry an extra header like X-Internal-Auth: secret, whereas /user/… should not.
+
+
+Task 17 uses the same mechanism as Task 3 (an ExchangeFilterFunction) but adds routing logic so the filter
+mutates headers only for certain paths / conditions. Below is a drop-in filter that does exactly that, plus the 
+tiny builder tweak.
+
+A) Route-aware header filter (NEW)
+```java
+
+package reactive.httpwebclientservice.filters;
+
+import org.springframework.http.HttpHeaders;
+import org.springframework.util.StringUtils;
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.util.function.Function;
+
+public class RouteAwareHeaderFilter implements ExchangeFilterFunction {
+
+    /**
+     * Optional: allow overriding the internal auth value via Reactor Context key "internalAuth".
+     * If not found, fall back to this defaultSupplier.
+     */
+    private final Function<ClientRequest, String> defaultInternalAuthSupplier;
+
+    public static final String CTX_INTERNAL_AUTH = "internalAuth";           // <- context key
+    public static final String HDR_INTERNAL_AUTH = "X-Internal-Auth";        // <- header we add
+    public static final String HDR_PREVIEW_FLAG  = "X-Use-Preview";          // <- if present, bump API version
+    public static final String HDR_API_VERSION   = "X-API-Version";
+
+    public RouteAwareHeaderFilter(Function<ClientRequest, String> defaultInternalAuthSupplier) {
+        this.defaultInternalAuthSupplier = defaultInternalAuthSupplier;
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        final URI uri = request.url();
+        final String path = uri.getPath(); // e.g. "/api/v1/user-with-data/123"
+
+        return Mono.deferContextual(ctxView -> {
+            ClientRequest.Builder builder = ClientRequest.from(request);
+
+            // 1) If caller sent X-Use-Preview, force an API version header (example of header→header logic).
+            if (request.headers().containsKey(HDR_PREVIEW_FLAG)) {
+                builder.headers(h -> {
+                    if (!StringUtils.hasText(h.getFirst(HDR_API_VERSION))) {
+                        h.set(HDR_API_VERSION, "preview");
+                    }
+                });
+            }
+
+            // 2) Path-based rule: for /user-with-data/** add internal auth; for /user/** ensure it’s absent.
+            if (path.startsWith("/api/v1/user-with-data/")) {
+                // Resolve internal auth value: prefer Reactor Context, else fallback supplier
+                String internalAuth = ctxView.hasKey(CTX_INTERNAL_AUTH)
+                        ? ctxView.get(CTX_INTERNAL_AUTH)
+                        : defaultInternalAuthSupplier.apply(request);
+
+                if (internalAuth != null && !internalAuth.isBlank()) {
+                    builder.headers(h -> h.set(HDR_INTERNAL_AUTH, internalAuth));
+                }
+            } else if (path.startsWith("/api/v1/user/")) {
+                // Make sure we don't leak the internal header on the simple user endpoint
+                builder.headers(h -> h.remove(HDR_INTERNAL_AUTH));
+            }
+
+            // 3) (Optional) Normalize/guard other headers here
+            builder.headers(h -> ensureNoEmptyValues(h));
+
+            return next.exchange(builder.build());
+        });
+    }
+
+    private static void ensureNoEmptyValues(HttpHeaders h) {
+        // tiny safety: drop empty preview flag
+        if (h.containsKey(HDR_PREVIEW_FLAG) && (h.getFirst(HDR_PREVIEW_FLAG) == null || h.getFirst(HDR_PREVIEW_FLAG).isBlank())) {
+            h.remove(HDR_PREVIEW_FLAG);
+        }
+    }
+}
+
+
+
+```
+How it works
+• Looks at request.url().getPath() and applies headers only for matching routes.
+• Optionally reads internalAuth from the Reactor Context (seeded per request), else uses a default supplier.
+
+B) Wire it into your existing builder (one line)
+In your ApplicationBeanConfiguration.loadBalancedWebClientBuilder(...), where you add request-mutating filters 
+(correlation/auth) before retry, add the new filter alongside them:
+
+```java
+// add this near your other filter instantiations
+var routeAwareFilter = new RouteAwareHeaderFilter(req -> "secret-default-token"); // or pull from props
+
+// ...
+
+.filters(list -> {
+    // logging (if you keep it), then OUTERMOST resilience (as you have)
+    list.add(loggingFilter);
+    list.add(0, r4jFilter);
+
+    // error mapping
+    list.add(errorMapping);
+
+    // request-mutating filters should run BEFORE retry so each retry includes headers
+    list.add(correlationFilter);
+    list.add(authFilter);
+    list.add(routeAwareFilter);   // <— NEW: conditional header logic lives with other mutators
+
+    // retry last (inner)
+    list.add(retryFilter);
+});
+
+
+```
+That’s it. 
+Calls to /api/v1/user-with-data/** will carry X-Internal-Auth, calls to /api/v1/user/** won’t.
+BUT after the test, I still dont see the newlly added header. Why?
+
+X-Internal-Auth is a request header of the WebClient. Postman shows response headers, so you 
+won’t see it there unless your backend echoes it back.
+Verify it is in the WebClient’s request logs. - BUT ITS NOT THERE!? WHY? Because out logging 
+filter is triggered before the outgoing request is mutated by adding the new header. So we need
+to log also right after the outgoing request is mutated. How to achieve this?
+Simply add a second filter a little bit lower in the list, like so:
+```java
+                    list.add(routeAwareFilter);  
+                    list.add(loggingFilter); // SECOND time added same logging filter, to ensure any mutated requests are alo logged
+                    // INNER
+                    list.add(retryFilter);
+                });
+
+```
+
+Now when postman client sends this:
+GET http://localhost:8080/proxy/user-with-data/2?X-Debug-Log=true (note: the parameter ?X-Debug-Log=true does not play any role here )
+, this is logged:
+```cpp
+ --> GET http://backend-service/api/v1/user-with-data/2
+Accept: [application/json, */*]
+user-agent: [PostmanRuntime/7.46.0]
+postman-token: [e617c4ec-647d-4f8d-a4c3-852abd0835dd]
+host: [localhost:8080]
+accept-encoding: [gzip, deflate, br]
+connection: [keep-alive]
+X-Correlation-Id: [14965d50-5106-4700-9c16-01a42a91cf1a]
+Authorization: [***]
+X-Internal-Auth: [secret-default-token]         <<<----- THIS IS OUR CUSTOM HEADER
+```
+but when postmal sends request to that path:
+GET http://localhost:8080/proxy/user/5?X-Debug-Log=true (note: the parameter ?X-Debug-Log=true does not play any role here )
+, there is no such X-Internal-Auth: header in the outgoing request of the WebClient.
+
+
+
+
+
+                END of experiment to customize the WebClient -  17. Conditional Logic Based on Request Path or Headers
+
+
+
+
+
+
+
 
 18. Capturing Response Cookies and Propagating Them
     If your backend returns Set-Cookie: SESSION=xyz on one call, you may want to store and reuse that in subsequent calls
