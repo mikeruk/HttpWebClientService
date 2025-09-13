@@ -25,7 +25,15 @@ dservice:
   service-id: "backend-service"
   use-eureka: true
   authToken: "superSecretToken"
-
+  http:
+    protocol: AUTO        # AUTO | H2 | H2C | H1
+    tcp-keep-alive: true
+    pool:
+      max-connections: 200
+      pending-acquire-timeout: 45s
+      max-idle: 30s
+      max-life: 5m
+      evict-in-background: 60s
 #  dservice: is not special to Spring. It’s simply a grouping key (a map) under which you put your settings.
 #  Under dservice:, you create a property called base-url whose value is http://localhost:8081.
 #  Later, your code will read user.base-url instead of having builder.baseUrl("http://localhost:8081") hard-coded.

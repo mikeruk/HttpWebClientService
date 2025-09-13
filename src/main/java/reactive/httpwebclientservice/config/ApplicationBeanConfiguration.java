@@ -40,19 +40,101 @@ import reactive.httpwebclientservice.cookies.InMemoryCookieJar;
 import reactive.httpwebclientservice.exceptions.ApiException;
 import reactive.httpwebclientservice.filters.*;
 import reactive.httpwebclientservice.utils.Correlation;
+import reactor.netty.http.HttpProtocol;
 import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
 
 import java.time.Duration;
 import java.util.List;
 
+import io.netty.handler.ssl.SslContextBuilder;
+import reactor.netty.http.HttpProtocol;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.tcp.SslProvider;
+
+import javax.net.ssl.SSLException;
+
+
 @Configuration
 public class ApplicationBeanConfiguration {
 
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(ApplicationBeanConfiguration.class);
+
     private final DserviceClientProperties props;
+
 
     // Constructor injection of our properties holder
     public ApplicationBeanConfiguration(DserviceClientProperties props) {
         this.props = props;
+    }
+
+    /* ── NEW: build a ConnectionProvider (pool) driven by properties ──────── */
+    private ConnectionProvider connectionProvider(String name) {
+        var p = props.getHttp().getPool();
+        return ConnectionProvider.builder(name)
+                .maxConnections(p.getMaxConnections())
+                .pendingAcquireTimeout(p.getPendingAcquireTimeout())
+                .maxIdleTime(p.getMaxIdle())
+                .maxLifeTime(p.getMaxLife())
+                .evictInBackground(p.getEvictInBackground())
+                .lifo() // prefer recently-used
+                .build();
+    }
+
+    /* ── NEW: apply protocol + TLS/H2 settings + TCP keepalive + logging ──── */
+    private HttpClient applyHttpVersionAndKeepAlive(HttpClient http, String connectorName) {
+        var httpOpts = props.getHttp();
+        var proto = httpOpts.getProtocol();
+
+        // TCP keep-alive (kernel-level probing; separate from HTTP keep-alive)
+        http = http.option(ChannelOption.SO_KEEPALIVE, httpOpts.isTcpKeepAlive());
+
+        switch (proto) {
+            case H1 -> {
+                http = http.protocol(HttpProtocol.HTTP11);
+                log.info("[{}] Forcing HTTP/1.1", connectorName);
+            }
+            case H2 -> {
+                // TLS + ALPN with HTTP/2
+                http = http
+                        .secure(ssl -> {
+                            try {
+                                ssl.sslContext(SslContextBuilder.forClient().build());
+                            } catch (SSLException e) {
+                                throw new RuntimeException(e);
+                            }
+                        })
+                        .protocol(HttpProtocol.H2, HttpProtocol.HTTP11);
+                log.info("[{}] Forcing HTTP/2 (TLS/ALPN)", connectorName);
+            }
+            case H2C -> {
+                // Cleartext HTTP/2
+                http = http.protocol(HttpProtocol.H2C, HttpProtocol.HTTP11);
+                log.info("[{}] Forcing HTTP/2 cleartext (h2c)", connectorName);
+            }
+            case AUTO -> {
+                // Let Reactor/ALPN negotiate (HTTP/1.1 will be used unless TLS+ALPN+server H2)
+                http = http.protocol(HttpProtocol.HTTP11, HttpProtocol.H2);
+                log.info("[{}] Protocol AUTO (negotiate H2 when possible, else HTTP/1.1)", connectorName);
+            }
+        }
+
+        // Log what got negotiated at runtime (TLS only)
+        http = http.doOnConnected(conn -> {
+            var ch = conn.channel();
+            var ssl = ch.pipeline().get(io.netty.handler.ssl.SslHandler.class);
+            if (ssl != null) {
+                String ap = ssl.applicationProtocol();
+                if (ap != null && !ap.isBlank()) {
+                    log.info("[{}] Negotiated application protocol: {}", connectorName, ap);
+                }
+            } else {
+                log.debug("[{}] Cleartext connection (no TLS/ALPN)", connectorName);
+            }
+        });
+
+        return http;
     }
 
     /** Low-level Reactor Netty client with timeouts. */
@@ -74,28 +156,29 @@ public class ApplicationBeanConfiguration {
                 // (Optional) enable Reactor Netty client I/O metrics (Micrometer-backed) at the socket level:
                 .metrics(true, uri -> uri); // <— use this public overload;
 
+        /* NEW: apply protocol, TLS/H2 and TCP keepalive */
+        http = applyHttpVersionAndKeepAlive(http, "defaultConnector");
 
         return new ReactorClientHttpConnector(http);
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     // NEW: a more tolerant connector specifically for VERY large uploads.
-    //  - no write-idle timeout (or set it very high)
-    //  - longer overall response timeout
-    // Keep your general connector strict for normal traffic.
-    // ──────────────────────────────────────────────────────────────────────────
     @Bean("uploadConnector")
     ReactorClientHttpConnector uploadClientHttpConnector() {
-        HttpClient http = HttpClient.create()
+        ConnectionProvider provider = connectionProvider("upload-pool");
+
+        HttpClient http = HttpClient.create(provider)
                 .wiretap(true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
-                .responseTimeout(Duration.ofHours(24)) // uploads can be LONG
+                .responseTimeout(Duration.ofHours(24))
                 .doOnConnected(conn -> conn
-                        // Disable write-idle timeout for streaming TBs
-                        .addHandlerLast(new ReadTimeoutHandler(0))   // 0 = disabled
-                        .addHandlerLast(new WriteTimeoutHandler(0))
-                )
+                        .addHandlerLast(new ReadTimeoutHandler(0))
+                        .addHandlerLast(new WriteTimeoutHandler(0)))
                 .metrics(true, uri -> uri);
+
+        /* NEW: apply protocol, TLS/H2 and TCP keepalive */
+        http = applyHttpVersionAndKeepAlive(http, "uploadConnector");
+
         return new ReactorClientHttpConnector(http);
     }
 

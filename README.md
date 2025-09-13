@@ -5549,20 +5549,318 @@ I am not using any server side certificates, so I will skip this task for now:
 
 
 
-
-
-
-
-
-
-
-
+                START of experiment to customize the WebClient -  21. Customizing HTTP/2 or HTTP/1.1 Features
 
 
 
 21. Customizing HTTP/2 or HTTP/1.1 Features
     You might want to force HTTP/2 (for multiplexing) or explicitly disable HTTP/2 if your server doesn’t support it (and your client
     negotiates it automatically). You can also tweak “keep-alive” settings.
+
+
+To understand what multiplexing is, lets give example with a browser loading an html page. First, the
+browser sends one single HTTP GET request. It is handled via one TCP connection, which opens a port.
+The response contains html page, with <link> url, <style> resources urls, etc. The browser parses them
+and will start executing them - meaning will start sending request for each <link> or css to fetch it.
+If the remote server supports only HTTTP version 1 protocol, then each fetch GET request for the
+<link> will generate one TCP connection, which will open a port - these open ports mean more work
+for the core to process data. The browser can send many GET request simultaneously, but each request
+will open its own TCP connection and port. Yes - they are concurrent (simultaneous)  but it is
+not yet multiplexing!
+What is multiplexing and when is it possible!? 
+Multiplexing is possible only with HTTP protocol version 2. The browser opens only one TCP connection
+with one open port, but over that TCP connection flow concurrently (simultaneously) more than one
+HTTP Get Requests. That is multiplexing. It reduces the number of open ports which reduces the work load
+for the processing core.
+
+
+Here’s a clean, per-client way to control HTTP/2 vs HTTP/1.1 (including h2c), 
+plus keep-alive/connection-pool knobs—without disturbing the rest of your app. I’ll keep your
+original code and clearly mark only the new bits.
+
+1) Add per-client HTTP options to your properties
+The new code is marked with a comment:
+```java
+// ─────────────────────────────────────────────────────────────────────────────
+// DserviceClientProperties  (ADD NEW FIELDS + NESTED TYPES)
+// ─────────────────────────────────────────────────────────────────────────────
+@Component
+@ConfigurationProperties(prefix = "dservice")
+public class DserviceClientProperties {
+
+    private String baseUrl;
+    private String serviceId;
+    private boolean isUseEureka;
+    private String authToken;
+
+    /* ── NEW: per-client HTTP options (protocol + pool/keepalive) ─────────── */
+    private HttpOptions http = new HttpOptions();
+
+    // getters/setters …
+
+    public HttpOptions getHttp() { return http; }
+    public void setHttp(HttpOptions http) { this.http = http; }
+
+    /* NEW */
+    public static class HttpOptions {
+        private Protocol protocol = Protocol.AUTO;      // AUTO | H2 | H2C | H1
+        private boolean tcpKeepAlive = true;            // TCP-level keepalive
+        private Pool pool = new Pool();
+
+        public Protocol getProtocol() { return protocol; }
+        public void setProtocol(Protocol protocol) { this.protocol = protocol; }
+
+        public boolean isTcpKeepAlive() { return tcpKeepAlive; }
+        public void setTcpKeepAlive(boolean tcpKeepAlive) { this.tcpKeepAlive = tcpKeepAlive; }
+
+        public Pool getPool() { return pool; }
+        public void setPool(Pool pool) { this.pool = pool; }
+    }
+
+    /* NEW */
+    public enum Protocol { AUTO, H2, H2C, H1 }
+
+    /* NEW */
+    public static class Pool {
+        private int maxConnections = 200;
+        private Duration pendingAcquireTimeout = Duration.ofSeconds(45);
+        private Duration maxIdle = Duration.ofSeconds(30);
+        private Duration maxLife = Duration.ofMinutes(5);
+        private Duration evictInBackground = Duration.ofSeconds(60);
+
+        public int getMaxConnections() { return maxConnections; }
+        public void setMaxConnections(int maxConnections) { this.maxConnections = maxConnections; }
+
+        public Duration getPendingAcquireTimeout() { return pendingAcquireTimeout; }
+        public void setPendingAcquireTimeout(Duration pendingAcquireTimeout) { this.pendingAcquireTimeout = pendingAcquireTimeout; }
+
+        public Duration getMaxIdle() { return maxIdle; }
+        public void setMaxIdle(Duration maxIdle) { this.maxIdle = maxIdle; }
+
+        public Duration getMaxLife() { return maxLife; }
+        public void setMaxLife(Duration maxLife) { this.maxLife = maxLife; }
+
+        public Duration getEvictInBackground() { return evictInBackground; }
+        public void setEvictInBackground(Duration evictInBackground) { this.evictInBackground = evictInBackground; }
+    }
+}
+
+
+```
+Optional YAML (keeps defaults unless you override)
+```yaml
+dservice:
+  http:
+    protocol: AUTO        # AUTO | H2 | H2C | H1
+    tcp-keep-alive: true
+    pool:
+      max-connections: 200
+      pending-acquire-timeout: 45s
+      max-idle: 30s
+      max-life: 5m
+      evict-in-background: 60s
+
+```
+Notes
+• H2 = HTTP/2 over TLS (ALPN). Your backend must enable HTTP/2 (e.g., server.http2.enabled=true on the server).
+• H2C = HTTP/2 cleartext. Most servlet servers don’t support it; Netty does. Use only if your server actually speaks h2c.
+• AUTO = let Reactor Netty negotiate (HTTP/1.1 by default; can upgrade to H2 if TLS+ALPN and server supports it).
+
+2) Wire HTTP/2 / HTTP/1.1 + keep-alive/pool in your connectors
+The ApplicationBeanConfiguration is updated with these new lines:
+```java
+// ─────────────────────────────────────────────────────────────────────────────
+// ApplicationBeanConfiguration  (ONLY ADDED/CHANGED SECTIONS ARE MARKED)
+// ─────────────────────────────────────────────────────────────────────────────
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    // NEW - added a logger
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(ApplicationBeanConfiguration.class);
+
+    private final DserviceClientProperties props;
+
+    public ApplicationBeanConfiguration(DserviceClientProperties props) {
+        this.props = props;
+    }
+
+    /* ── NEW: build a ConnectionProvider (pool) driven by properties ──────── */
+    private ConnectionProvider connectionProvider(String name) {
+        var p = props.getHttp().getPool();
+        return ConnectionProvider.builder(name)
+                .maxConnections(p.getMaxConnections())
+                .pendingAcquireTimeout(p.getPendingAcquireTimeout())
+                .maxIdleTime(p.getMaxIdle())
+                .maxLifeTime(p.getMaxLife())
+                .evictInBackground(p.getEvictInBackground())
+                .lifo() // prefer recently-used
+                .build();
+    }
+
+    /* ── NEW: apply protocol + TLS/H2 settings + TCP keepalive + logging ──── */
+    private HttpClient applyHttpVersionAndKeepAlive(HttpClient http, String connectorName) {
+        var httpOpts = props.getHttp();
+        var proto = httpOpts.getProtocol();
+
+        // TCP keep-alive (kernel-level probing; separate from HTTP keep-alive)
+        http = http.option(ChannelOption.SO_KEEPALIVE, httpOpts.isTcpKeepAlive());
+
+        switch (proto) {
+            case H1 -> {
+                http = http.protocol(HttpProtocol.HTTP11);
+                log.info("[{}] Forcing HTTP/1.1", connectorName);
+            }
+            case H2 -> {
+                // TLS + ALPN with HTTP/2
+                http = http
+                        .secure(ssl -> {
+                            try {
+                                ssl.sslContext(SslContextBuilder.forClient().build());
+                            } catch (SSLException e) {
+                                throw new RuntimeException(e);
+                            }
+                        })
+                        .protocol(HttpProtocol.H2, HttpProtocol.HTTP11);
+                log.info("[{}] Forcing HTTP/2 (TLS/ALPN)", connectorName);
+            }
+            case H2C -> {
+                // Cleartext HTTP/2
+                http = http.protocol(HttpProtocol.H2C, HttpProtocol.HTTP11);
+                log.info("[{}] Forcing HTTP/2 cleartext (h2c)", connectorName);
+            }
+            case AUTO -> {
+                // Let Reactor/ALPN negotiate (HTTP/1.1 will be used unless TLS+ALPN+server H2)
+                http = http.protocol(HttpProtocol.HTTP11, HttpProtocol.H2);
+                log.info("[{}] Protocol AUTO (negotiate H2 when possible, else HTTP/1.1)", connectorName);
+            }
+        }
+
+        // Log what got negotiated at runtime (TLS only)
+        http = http.doOnConnected(conn -> {
+            var ch = conn.channel();
+            var ssl = ch.pipeline().get(io.netty.handler.ssl.SslHandler.class);
+            if (ssl != null) {
+                String ap = ssl.applicationProtocol();
+                if (ap != null && !ap.isBlank()) {
+                    log.info("[{}] Negotiated application protocol: {}", connectorName, ap);
+                }
+            } else {
+                log.debug("[{}] Cleartext connection (no TLS/ALPN)", connectorName);
+            }
+        });
+
+        return http;
+    }
+
+    /** Low-level Reactor Netty client with timeouts. */
+    @Bean("defaultConnector")
+    ReactorClientHttpConnector clientHttpConnector() {
+        // CHANGED: use a named pool + protocol settings
+        ConnectionProvider provider = connectionProvider("default-pool");
+
+        HttpClient http = HttpClient.create(provider)
+                // CONNECT timeout (TCP handshake)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+                // RESPONSE timeout (first byte)
+                .responseTimeout(Duration.ofSeconds(100))
+                // READ/WRITE inactivity timeouts
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(30))
+                        .addHandlerLast(new WriteTimeoutHandler(10)))
+                .metrics(true, uri -> uri);
+
+        /* NEW: apply protocol, TLS/H2 and TCP keepalive */
+        http = applyHttpVersionAndKeepAlive(http, "defaultConnector");
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+    // NEW: a more tolerant connector specifically for VERY large uploads.
+    @Bean("uploadConnector")
+    ReactorClientHttpConnector uploadClientHttpConnector() {
+        ConnectionProvider provider = connectionProvider("upload-pool");
+
+        HttpClient http = HttpClient.create(provider)
+                .wiretap(true)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
+                .responseTimeout(Duration.ofHours(24))
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(0))
+                        .addHandlerLast(new WriteTimeoutHandler(0)))
+                .metrics(true, uri -> uri);
+
+        /* NEW: apply protocol, TLS/H2 and TCP keepalive */
+        http = applyHttpVersionAndKeepAlive(http, "uploadConnector");
+
+        return new ReactorClientHttpConnector(http);
+    }
+
+    // … (everything else in this class stays as you already have it: metrics, observation,
+    //     resilience4j, builders, filters, uploadWebClient bean, etc.)
+}
+
+
+```
+
+Why this works?
+
+HttpClient.protocol(HttpProtocol…) sets which wire protocols the client offers/uses.
+
+For H2 (TLS) you also need ALPN: .secure(...).protocol(H2, HTTP11).
+
+For H2C (cleartext) there’s no TLS; use .protocol(H2C, HTTP11) (only if server supports h2c).
+
+Connection reuse/HTTP keep-alive behavior is controlled by the connection pool 
+(ConnectionProvider) plus normal HTTP semantics—your client will naturally reuse idle 
+connections up to maxConnections, within maxIdle/maxLife.
+
+
+How to verify which protocol you’re actually using? Look at your app logs (we log it on connect):
+```text
+[defaultConnector] Protocol AUTO (negotiate H2 when possible, else HTTP/1.1) 
+[uploadConnector] Protocol AUTO (negotiate H2 when possible, else HTTP/1.1)
+```
+True! I found that log text.
+Those log lines (“Protocol AUTO…”) are your setup logs that mean you configured the client to 
+offer H2 with fallback to HTTP/1.1. The actual protocol is negotiated per connection at runtime.
+You’ll only see “Negotiated application protocol: h2” after a real request with DEBUG logging enabled.
+
+Another way to verify: but I already have this.
+```yaml
+logging.level.reactor.netty.http.client.HttpClient=DEBUG
+
+```
+
+(Server) If your backend is Spring Boot, enable HTTP/2 there when you want TLS/H2:
+```yaml
+server:
+  http2:
+    enabled: true
+
+```
+
+Quick tips:
+If your backend doesn’t support HTTP/2 yet, set dservice.http.protocol: H1 to avoid any ALPN negotiation overhead.
+If you want the benefits of multiplexing (many concurrent requests per connection), enable H2 on both sides and set protocol: H2 (client) + server.http2.enabled: true (server with TLS).
+Keep your upload connector lenient (long timeouts, no write idle) and your default connector stricter, as you already did.
+
+
+
+
+                END of experiment to customize the WebClient -  21. Customizing HTTP/2 or HTTP/1.1 Features
+
+
+
+
+
+
+
+
+
+
+
+
 
 22. Custom Request Throttling (Rate Limiting)
     To avoid overwhelming your backend (or to respect the third-party’s rate limits), you might want to throttle outgoing
