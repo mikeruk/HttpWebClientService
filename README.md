@@ -4816,13 +4816,79 @@ Therefore, skipping this task below:
 
 
 
-15. Defining Custom Error Handling Strategies by Status Family
-    Maybe you want to treat all 4xx as “client failures” but still parse the body, while all 5xx should throw an exception immediately
-    (and never convert into a DTO).
+                START of experiment to customize the WebClient -  16. Custom DNS Resolution / Hostname Verification
+
+This task will not be implemented, because it is not really that critical. But below is a short explanation in which
+cases such custom Custom DNS Resolution can become handy.
 
 16. Custom DNS Resolution / Hostname Verification
     If you need to bypass DNS resolution (e.g. to hardcode an IP → hostname mapping for testing), or if you need to skip hostname
     verification (for internal certs).
+
+
+This topic mixes three layers that often get conflated: service discovery, DNS resolution, and TLS hostname verification. Here’s the clean mental model.
+The normal path (who does what?)
+1. Your code (WebClient)
+• Builds a request to http://backend-service/... (a service id, not a DNS hostname).
+2. Service discovery / load balancing (Spring Cloud LoadBalancer + Eureka)
+• Looks up backend-service in Eureka, gets a list of instances (each has host + port + metadata).
+• Picks one instance (round-robin, zone pref, your custom filters, etc.).
+• Produces a concrete target like http://hostA.company.local:8081.
+3. DNS resolution (OS/JVM/Netty)
+• If hostA.company.local is a hostname, Reactor Netty asks the DNS resolver to turn it into an IP.
+◦ If Eureka already returned an IP (many setups do), DNS is not used for that call.
+◦ If it returned a hostname, DNS is used.
+4. TLS (if https)
+• The client performs a TLS handshake.
+• Hostname verification checks that the cert’s CN/SAN matches the hostname you connected to, and SNI is set accordingly.
+Why might you bypass/override DNS?
+• Testing/debugging: Pin api.company.local to a specific IP (blue/green canary, reproduce a bug on a node).
+• Private networks / split-horizon DNS: Your client can’t reach the corp DNS, so you point to specific DNS servers or hardcode.
+• Eureka returns hostnames, but you want to force v4 / a particular resolver.
+• Temporary workarounds while DNS is being updated/propagated.
+Ways to do it (from blunt to precise):
+• OS-level: /etc/hosts entry → affects the whole machine (quick + universal, but global).
+• JVM/Netty-level: Provide a custom AddressResolverGroup to Reactor Netty (map certain names to specific IPs, or use custom DNS servers).
+• Avoid DNS entirely: Make Eureka return IPs instead of hostnames (common in container/K8s setups).
+How does this relate to Eureka?
+• Eureka is not DNS. It’s an application-level registry returning service instances (host/port).
+• If those hosts are IPs, you don’t use DNS for that hop.
+• If they are names, DNS is still needed after discovery.
+Hostname verification (TLS)
+• Purpose: ensure you’re talking to the intended server (mitigates MITM).
+• It compares the requested hostname to the certificate’s CN/SAN.
+• If you connect by IP address, the certificate must include that IP in SAN, or hostname verification fails.
+• Skipping hostname verification is unsafe; only do it for local/dev, and document it clearly. Better:
+◦ Install your internal CA into a truststore and configure the client to use it (keeps verification on).
+◦ Or issue certs whose SAN includes the hostname/IP you actually connect to.
+When would you disable hostname verification?
+• Dev-only, with self-signed or mismatched certs, to unblock flow while you fix PKI.
+• Even then, prefer to trust the right CA instead of disabling verification altogether.
+Certbot?
+• Certbot obtains public TLS certs from Let’s Encrypt for publicly reachable domains.
+• In corporate/private networks you usually don’t use Certbot; you use:
+◦ Corporate CA,
+◦ or self-signed CA and distribute its root to clients,
+◦ or your platform’s cert manager (Kubernetes cert-manager, etc.).
+
+
+
+
+
+                END of experiment to customize the WebClient -  16. Custom DNS Resolution / Hostname Verification
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 17. Conditional Logic Based on Request Path or Headers
     Suppose you want different behavior when calling /user/{id} vs /user-with-data/{id}. For instance, maybe calls to /user-with-data/…
