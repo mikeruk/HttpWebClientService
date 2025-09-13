@@ -36,6 +36,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.support.WebClientAdapter;
 import org.springframework.web.service.invoker.HttpServiceProxyFactory;
 import reactive.httpwebclientservice.HttpClientInterface;
+import reactive.httpwebclientservice.cookies.InMemoryCookieJar;
 import reactive.httpwebclientservice.exceptions.ApiException;
 import reactive.httpwebclientservice.filters.*;
 import reactive.httpwebclientservice.utils.Correlation;
@@ -219,6 +220,14 @@ public class ApplicationBeanConfiguration {
         return new LoadBalancerZoneConfig("eu-west-1a"); // set YOUR client zone here
     }
 
+
+    // NEW (Task 18): a singleton, in-memory cookie jar
+    @Bean
+    public InMemoryCookieJar inMemoryCookieJar() {
+        return new InMemoryCookieJar();
+    }
+
+
     /**
      * A builder that applies the LoadBalancerExchangeFilterFunction
      * so URIs like http://backend-service are resolved via Eureka.
@@ -235,7 +244,8 @@ public class ApplicationBeanConfiguration {
                                                           ObservationRegistry observationRegistry,
                                                           ClientRequestObservationConvention webClientObservationConvention,
                                                           CircuitBreakerRegistry circuitBreakerRegistry,
-                                                          BulkheadRegistry bulkheadRegistry)
+                                                          BulkheadRegistry bulkheadRegistry,
+                                                          InMemoryCookieJar cookieJar )
     {
 
         // Per-client, Spring-aware mappers:
@@ -303,7 +313,8 @@ public class ApplicationBeanConfiguration {
         // add this near your other filter instantiations
         var routeAwareFilter = new RouteAwareHeaderFilter(req -> "secret-default-token"); // or pull from props
 
-
+        // NEW (Task 18): cookie filter (set logCookies=true if you want to see its debug lines)
+        var cookieJarFilter      = new CookieFilter(cookieJar, true);
 
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
@@ -337,7 +348,7 @@ public class ApplicationBeanConfiguration {
                     // mutate requests, then allow retry to re-run with headers
                     list.add(correlationFilter);
                     list.add(authFilter);
-
+                    list.add(cookieJarFilter); // <-- NEW (Task 18)
                     // ⬇️ add cookies here so mutations above are already applied;
                     // and retries below will include cookies on each attempt
                     list.add(cookieFilter);

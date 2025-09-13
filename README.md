@@ -5043,7 +5043,7 @@ X-Correlation-Id: [14965d50-5106-4700-9c16-01a42a91cf1a]
 Authorization: [***]
 X-Internal-Auth: [secret-default-token]         <<<----- THIS IS OUR CUSTOM HEADER
 ```
-but when postmal sends request to that path:
+but when postman sends request to that path:
 GET http://localhost:8080/proxy/user/5?X-Debug-Log=true (note: the parameter ?X-Debug-Log=true does not play any role here )
 , there is no such X-Internal-Auth: header in the outgoing request of the WebClient.
 
@@ -5058,11 +5058,440 @@ GET http://localhost:8080/proxy/user/5?X-Debug-Log=true (note: the parameter ?X-
 
 
 
+                START of experiment to customize the WebClient -  18. Capturing Response Cookies and Propagating Them
+
+
 
 
 18. Capturing Response Cookies and Propagating Them
     If your backend returns Set-Cookie: SESSION=xyz on one call, you may want to store and reuse that in subsequent calls
     (similar to “sticky sessions” in #11 but here perhaps for a different domain).
+
+The Backend-service currently has few Endpoints which really return such Set-Cookie header , like so:
+```java
+
+@RestController
+@RequestMapping("/api/v1")
+class CookieDemoController {
+
+    @GetMapping("/cookie/set")
+    ResponseEntity<String> set() {
+        return ResponseEntity.ok()
+                .header("Set-Cookie", "SESSION=abc123; Path=/; HttpOnly") // demo cookie
+                .body("cookie set");
+    }
+
+    @GetMapping("/cookie/need")
+    ResponseEntity<String> need(@CookieValue(name="SESSION", required=false) String session) {
+        if (session == null) return ResponseEntity.status(401).body("no cookie");
+        return ResponseEntity.ok("have " + session);
+    }
+}
+
+```
+As you see the backend-service (as in here above shown) now has cookie endpoints.
+
+Here’s exactly how to capture Set-Cookie on one call and automatically send the cookie on 
+later calls from your WebClient app.
+Below I keep your existing code and add new classes/beans, clearly marked with // NEW (Task 18)
+comments, and show where to wire the filter in.
+
+
+1) Add a small cookie jar + filter (WebClient app)
+
+InMemoryCookieJar.java — NEW (Task 18)
+```java
+package reactive.httpwebclientservice.cookies;
+
+import org.springframework.http.ResponseCookie;
+
+import java.net.URI;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Very simple in-memory cookie jar that stores cookies per host+path.
+ * - Domain rule: if Set-Cookie has Domain=X, we do suffix match; else host-only.
+ * - Path rule: requestPath startsWith(cookiePath, default "/").
+ * - Expiry: Max-Age=0 removes; positive Max-Age sets expiresAt; negative => session cookie.
+ */
+public final class InMemoryCookieJar {
+
+    private static final class StoredCookie {
+        final String name;
+        volatile String value;
+        final String domain;   // nullable
+        final String path;     // never null; default "/"
+        final boolean secure;
+        volatile Instant expiresAt; // nullable => session cookie
+
+        StoredCookie(ResponseCookie rc, Instant now) {
+            this.name = rc.getName();
+            this.value = rc.getValue();
+            this.domain = emptyToNull(rc.getDomain());
+            this.path = (rc.getPath() == null || rc.getPath().isBlank()) ? "/" : rc.getPath();
+            this.secure = rc.isSecure();
+            if (rc.getMaxAge() != null) {
+                long seconds = rc.getMaxAge().getSeconds();
+                if (seconds == 0) {
+                    this.expiresAt = Instant.EPOCH; // use as deletion marker
+                } else if (seconds > 0) {
+                    this.expiresAt = now.plusSeconds(seconds);
+                } else {
+                    this.expiresAt = null; // session cookie
+                }
+            } else {
+                this.expiresAt = null; // session cookie
+            }
+        }
+
+        boolean expired(Instant now) {
+            return expiresAt != null && !expiresAt.isAfter(now);
+        }
+
+        private static String emptyToNull(String s) {
+            return (s == null || s.isBlank()) ? null : s;
+        }
+    }
+
+    // host -> cookies (we keep all and match by path/expiry each request)
+    private final Map<String, List<StoredCookie>> store = new ConcurrentHashMap<>();
+
+    public void saveFrom(URI origin, Collection<ResponseCookie> setCookies) {
+        if (setCookies == null || setCookies.isEmpty()) return;
+        String host = origin.getHost();
+        Instant now = Instant.now();
+        store.compute(host, (h, list) -> {
+            if (list == null) list = new ArrayList<>();
+            for (ResponseCookie rc : setCookies) {
+                StoredCookie sc = new StoredCookie(rc, now);
+                // deletion?
+                if (sc.expiresAt != null && sc.expiresAt.equals(Instant.EPOCH)) {
+                    // remove by name+path(+domain match)
+                    list.removeIf(old -> namesMatch(old, sc) && domainEq(old, sc) && pathEq(old, sc));
+                    continue;
+                }
+                // upsert by name+path(+domain)
+                boolean updated = false;
+                for (StoredCookie old : list) {
+                    if (namesMatch(old, sc) && domainEq(old, sc) && pathEq(old, sc)) {
+                        old.value = sc.value;
+                        old.expiresAt = sc.expiresAt;
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated) list.add(sc);
+            }
+            // cleanup expired
+            list.removeIf(c -> c.expired(now));
+            return list;
+        });
+    }
+
+    public Map<String, String> cookiesFor(URI requestUri, boolean requireSecure) {
+        String host = requestUri.getHost();
+        String path = requestUri.getPath();
+        if (path == null || path.isBlank()) path = "/";
+        boolean isHttps = "https".equalsIgnoreCase(requestUri.getScheme());
+
+        Instant now = Instant.now();
+        List<StoredCookie> list = store.get(host);
+        if (list == null) return Collections.emptyMap();
+
+        Map<String, String> out = new LinkedHashMap<>();
+        for (StoredCookie c : list) {
+            if (c.expired(now)) continue;
+            // domain
+            if (c.domain != null) {
+                // suffix match (host ends with domain & not a partial label)
+                if (!domainMatches(host, c.domain)) continue;
+            } // else host-only, already keyed by host
+
+            // path
+            if (!path.startsWith(c.path)) continue;
+
+            // secure
+            if (c.secure && !(isHttps)) continue;
+            if (requireSecure && !c.secure) continue;
+
+            out.put(c.name, c.value);
+        }
+        return out;
+    }
+
+    private static boolean namesMatch(StoredCookie a, StoredCookie b) {
+        return Objects.equals(a.name, b.name);
+    }
+
+    private static boolean domainEq(StoredCookie a, StoredCookie b) {
+        return Objects.equals(a.domain, b.domain);
+    }
+
+    private static boolean pathEq(StoredCookie a, StoredCookie b) {
+        return Objects.equals(a.path, b.path);
+    }
+
+    private static boolean domainMatches(String host, String domain) {
+        String h = host.toLowerCase(Locale.ROOT);
+        String d = domain.toLowerCase(Locale.ROOT);
+        if (h.equals(d)) return true;
+        return h.endsWith("." + d);
+    }
+}
+
+
+
+```
+
+
+CookieFilter.java — NEW (Task 18)
+
+```java
+
+package reactive.httpwebclientservice.filters;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.ResponseCookie;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Mono;
+import reactive.httpwebclientservice.cookies.InMemoryCookieJar;
+
+import java.net.URI;
+import java.util.*;
+
+public class CookieFilter implements ExchangeFilterFunction {
+    private static final Logger log = LoggerFactory.getLogger(CookieFilter.class);
+    private final InMemoryCookieJar jar;
+    private final boolean logCookies; // toggle debug logs
+
+    public CookieFilter(InMemoryCookieJar jar, boolean logCookies) {
+        this.jar = jar;
+        this.logCookies = logCookies;
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        // 1) OUTBOUND: inject cookies for this URI
+        URI uri = request.url();
+        Map<String, String> toSend = jar.cookiesFor(uri, false);
+        ClientRequest mutated = (toSend.isEmpty())
+                ? request
+                : ClientRequest.from(request).cookies(c -> {
+                    toSend.forEach(c::add); // adds as Cookie: name=value ...
+                }).build();
+
+        if (logCookies && !toSend.isEmpty()) {
+            log.debug("CookieFilter → sending cookies to {}: {}", uri, toSend.keySet());
+        }
+
+        // 2) INBOUND: capture Set-Cookie from response and store
+        return next.exchange(mutated).doOnSuccess(resp -> {
+            MultiValueMap<String, ResponseCookie> cookies = resp.cookies(); // parsed cookies
+            if (cookies != null && !cookies.isEmpty()) {
+                List<ResponseCookie> all = new ArrayList<>();
+                cookies.values().forEach(all::addAll);
+                jar.saveFrom(uri, all);
+                if (logCookies) {
+                    log.debug("CookieFilter ← stored cookies from {}: {}", uri, all.stream().map(ResponseCookie::getName).toList());
+                }
+            } else {
+                // Some servers only send raw header; still covered by resp.cookies()
+                List<String> raw = resp.headers().asHttpHeaders().get(HttpHeaders.SET_COOKIE);
+                if (raw != null && !raw.isEmpty() && logCookies) {
+                    log.debug("CookieFilter ← received raw Set-Cookie from {}: {}", uri, raw);
+                }
+            }
+        });
+    }
+}
+
+```
+
+
+2) Wire the cookie filter into your existing WebClient builder
+   In your WebClient app ApplicationBeanConfiguration, add a cookie jar bean, create the 
+filter, and add it alongside your other request-mutating filters (so it runs before retry
+and before the post-logger if you want to see the cookies in logs).
+Update the ApplicationBeanConfiguration file with the single lines as shown here:
+```java
+// ... imports omitted for brevity
+import reactive.httpwebclientservice.cookies.InMemoryCookieJar;
+import reactive.httpwebclientservice.filters.CookieFilter;
+
+@Configuration
+public class ApplicationBeanConfiguration {
+
+    // ... your existing fields/beans unchanged
+
+    // NEW (Task 18): a singleton, in-memory cookie jar
+    @Bean
+    public InMemoryCookieJar inMemoryCookieJar() {
+        return new InMemoryCookieJar();
+    }
+
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder(
+            @Qualifier("defaultConnector") ReactorClientHttpConnector connector,
+            Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
+            ObservationRegistry observationRegistry,
+            ClientRequestObservationConvention webClientObservationConvention,
+            CircuitBreakerRegistry circuitBreakerRegistry,
+            BulkheadRegistry bulkheadRegistry,
+            InMemoryCookieJar cookieJar // <-- NEW (Task 18)
+    ) {
+        // ... your existing ObjectMapper / encoder / decoder setup unchanged
+
+        var retryFilter       = new RetryBackoffFilter(2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+        var errorMapping      = new ErrorMappingFilter();
+        var correlationFilter = new CorrelationHeaderFilter();
+        var authFilter        = new AuthHeaderFilter(props::getAuthToken);
+        var r4jFilter         = new Resilience4jFilter(circuitBreakerRegistry, bulkheadRegistry, req -> props.getServiceId());
+        var loggingFilter     = new HttpLoggingFilter(64 * 1024);
+
+        // NEW (Task 18): cookie filter (set logCookies=true if you want to see its debug lines)
+        var cookieJarFilter      = new CookieFilter(cookieJar, true);
+
+        return WebClient.builder()
+                .clientConnector(connector)
+                .observationRegistry(observationRegistry)
+                .observationConvention(webClientObservationConvention)
+                .codecs(c -> {
+                    c.defaultCodecs().jackson2JsonEncoder(encoder);
+                    c.defaultCodecs().jackson2JsonDecoder(decoder);
+                    c.defaultCodecs().maxInMemorySize(256 * 1024);
+                })
+                .filters(list -> {
+                    // PRE logger (if you keep two) — optional
+                    // list.add(preLogger);
+
+                    // Resilience outer
+                    list.add(0, r4jFilter);
+
+                    // Request mutators (headers/cookies) BEFORE retry so retries carry them
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+                    list.add(cookieJarFilter); // <-- NEW (Task 18)
+
+                    // POST logger to show final outbound headers (including Cookie)
+                    list.add(loggingFilter);
+
+                    // inner bits
+                    list.add(retryFilter);
+                    list.add(errorMapping);
+                });
+    }
+
+    // ... rest unchanged (userHttpInterface, uploadWebClient, etc.)
+}
+
+
+```
+
+3) Add 2 proxy endpoints in WebClient to drive the demo
+   Extend your HTTP interface — add these methods. But the below example is already present
+in the project.
+```java
+
+@HttpExchange(url = "/api/v1", accept = MediaType.APPLICATION_JSON_VALUE)
+public interface HttpClientInterface {
+
+    // ... your existing methods
+
+    // NEW (Task 18)
+    @GetExchange("/cookie/set")
+    Mono<ResponseEntity<String>> cookieSet();
+
+    @GetExchange("/cookie/need")
+    Mono<ResponseEntity<String>> cookieNeed();
+}
+
+
+```
+
+
+Add simple proxy methods in your controller (WebClient app)
+In whichever controller you’re already using (e.g., UserProxyController), so, 
+but luckily the below endpoints are already present in the project:
+```java
+// NEW (Task 18): drive cookie capture
+    @GetMapping("/cookie/set")
+    public Mono<ResponseEntity<String>> proxyCookieSet() {
+        return users.cookieSet();
+    }
+
+    // NEW (Task 18): should reuse the stored cookie automatically
+    @GetMapping("/cookie/need")
+    public Mono<ResponseEntity<String>> proxyCookieNeed() {
+        return users.cookieNeed();
+    }
+
+```
+
+4) Test
+    1. Call through the WebClient app:
+       ◦ GET http://localhost:8080/proxy/cookie/set
+       ▪ Backend returns Set-Cookie: SESSION=abc123; Path=/; HttpOnly
+       ▪ CookieFilter stores it (you’ll see CookieFilter ← stored cookies… if DEBUG enabled).
+    2. Next call:
+       ◦ GET http://localhost:8080/proxy/cookie/need
+       ▪ CookieFilter injects Cookie: SESSION=abc123 on the outbound request automatically.
+       ▪ Backend returns 200 "have abc123".
+       Your existing HttpLoggingFilter will also show the outgoing Cookie: header on the second call.
+       If you want to reduce noise in prod, set new CookieFilter(cookieJar, false) (but the cookie still works).
+
+Tested with Success!!
+
+But if the Postman client first sends GET request to the: /proxy/cookie/need (which asks for cookie, but its not set yet)
+instead of first sending GET to: /proxy/cookie/set (to actually set the cookie)
+, in such cases the response is:
+```cpp
+<-- 401 http://backend-service/api/v1/cookie/need (546 ms)
+   Content-Type: application/json
+  Content-Length: 9
+  Date: Sat, 13 Sep 2025 15:33:22 GMT
+⤷ body (9 bytes)
+
+no cookie
+
+network error for GET http://backend-service/api/v1/cookie/need: reactive.httpwebclientservice.exceptions.UnauthorizedException:Unauthorized
+```
+
+Notes:
+• If your backend starts returning Max-Age=0 (delete), the jar will remove it. This functionality is not implemented yet.
+
+• The backend demo cookie doesn’t set Domain, so it’s a host-only cookie. The jar stores it 
+against whatever host your WebClient sees (backend-service), which is correct for LB/Eureka calls.
+
+• This is a simple memory-only jar. For multi-instance WebClient apps, you might store cookies per-user or per-tenant; in that case, use a scoped jar (e.g., keyed by session id) or a persistent store.
+That’s it—now your WebClient captures Set-Cookie and propagates cookies automatically on subsequent requests.
+
+
+
+
+                END of experiment to customize the WebClient -  18. Capturing Response Cookies and Propagating Them
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 19. Bulkhead (Thread Pool) Isolation
     If your HTTP calls are expensive (e.g. large payload, slow DB), you may not want them to exhaust your main reactive event loops.
