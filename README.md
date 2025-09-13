@@ -5479,23 +5479,87 @@ That’s it—now your WebClient captures Set-Cookie and propagates cookies auto
 
 
 
+                START of experiment to customize the WebClient -  19. Bulkhead (Thread Pool) Isolation
 
 
-
-
-
-
-
-
-
-
-
-
-
+This task is really important because it improves the performace in case of problematic (big in size)
+work loads. However, I will not implemet it now in the project. Here is just a short explanation
+of the problem and the benefits:
 
 19. Bulkhead (Thread Pool) Isolation
     If your HTTP calls are expensive (e.g. large payload, slow DB), you may not want them to exhaust your main reactive event loops.
     You can isolate them in a dedicated thread pool (“bulkhead”) so that a spike in these calls doesn’t starve CPU for other traffic.
+
+
+“Bulkhead” is a resilience pattern that keeps one slow/expensive thing from sinking the whole ship—like watertight compartments on a boat.
+Here’s the mental model:
+
+• #1 Event-loop threads are precious
+WebClient + Reactor Netty run on a small pool of non-blocking event-loop threads. If you block them (slow DNS, big JSON write, file/db calls, TLS handshake hiccups), all requests stall. So you must prevent blocking work from living on those threads.
+
+• #2 Two bulkhead flavors (different tools/purposes)
+◦ Semaphore bulkhead (what you already wired with resilience4j-bulkhead):
+Limits how many calls can run concurrently (e.g., max 50). Extra calls fail fast or wait a tiny bit. It does not move work to other threads; it just caps concurrency. Super low overhead; still runs on the same scheduler.
+◦ Thread-pool bulkhead (Resilience4j’s thread-pool-bulkhead or Reactor schedulers):
+Offloads the work to a separate, bounded thread pool with its own queue. Spikes or slow I/O are contained to that pool. If the pool is full, you get fast failure rather than starving event loops.
+
+• #3 When to use which
+◦ Your WebClient flow is fully non-blocking and you only want to prevent overload → Semaphore bulkhead is ideal (what you have).
+◦ You have any blocking sections (filesystem, JDBC, gRPC stub that blocks, huge serialization, legacy libs), or a dependency that can stall unpredictably → Thread-pool bulkhead to isolate that latency and protect the rest.
+
+• #4 How this plays with Reactor
+◦ Reactor rule: don’t block event loops. If something blocks, use publishOn/subscribeOn with a dedicated bounded scheduler (or Resilience4j thread-pool bulkhead operator). That moves that segment off the event loop.
+◦ You can combine both: thread-pool bulkhead to isolate + semaphore bulkhead to cap concurrency upstream.
+
+• #5 Trade-offs
+◦ Thread-pool bulkhead adds context switches and queueing—tiny latency overhead, but strong isolation.
+◦ Semaphore bulkhead is lighter/faster but won’t help if the code inside is blocking the same threads.
+
+• #6 Observability/limits
+◦ Both types emit Micrometer metrics (successful/failed calls, queue usage, rejections).
+◦ Set timeouts alongside bulkheads so queued work doesn’t wait forever.
+
+In short: you already have concurrency capping (semaphore). “Thread Pool Isolation” is the next step when you need to offload slow or blocking parts to their own small, bounded pool so bursts or slowness can’t freeze the whole app.
+
+
+
+                END of experiment to customize the WebClient -  19. Bulkhead (Thread Pool) Isolation
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 20. Custom SSL Pinning (Pin a Specific Certificate Fingerprint)
     For maximum security, you might want to verify that the server’s certificate matches a known fingerprint (public-key pinning),
