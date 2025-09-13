@@ -5530,40 +5530,35 @@ In short: you already have concurrency capping (semaphore). “Thread Pool Isola
 
 
 
+                START of experiment to customize the WebClient -  20. Custom SSL Pinning (Pin a Specific Certificate Fingerprint)
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+I am not using any server side certificates, so I will skip this task for now:
 
 20. Custom SSL Pinning (Pin a Specific Certificate Fingerprint)
     For maximum security, you might want to verify that the server’s certificate matches a known fingerprint (public-key pinning),
     not just that it’s signed by the CA in your trust store.
+
+
+
+
+                END of experiment to customize the WebClient -  20. Custom SSL Pinning (Pin a Specific Certificate Fingerprint)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 21. Customizing HTTP/2 or HTTP/1.1 Features
     You might want to force HTTP/2 (for multiplexing) or explicitly disable HTTP/2 if your server doesn’t support it (and your client
