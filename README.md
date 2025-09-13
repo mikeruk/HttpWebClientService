@@ -4797,13 +4797,21 @@ And it was tests with success!!!
 
 
 
+                START of experiment to customize the WebClient -  15. Defining Custom Error Handling Strategies by Status Family
+
+
+
+This task is not implemented, because Custom Error Handling Strategies was implemented in Task: 4. Custom Error Decoding & Mapping to Exceptions
+Therefore, skipping this task below:
+
+15. Defining Custom Error Handling Strategies by Status Family
+    Maybe you want to treat all 4xx as “client failures” but still parse the body, while all 5xx should throw an exception immediately
+    (and never convert into a DTO).
 
 
 
 
-
-
-
+                END of experiment to customize the WebClient -  15. Defining Custom Error Handling Strategies by Status Family
 
 
 
