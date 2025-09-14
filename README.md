@@ -9,6 +9,33 @@
     https://docs.spring.io/spring-framework/reference/web/webflux-webclient.html    
 
 
+NB!!! Relates to task: 23. Custom Connection Pool Settings
+When implementing Actuator to and /actuator/metrics/ to get metrics from the App, please be 
+advised that these /actuator/metrics/ FOR the 'Reactor Netty' will never be available for query right 
+after you have started the application, even if you have applied all the settings correctly!
+To make them available under their standard paths like:
+http://localhost:8080/actuator/metrics/reactor.netty.connection.provider.active.connections
+YOU MUST FIRST make the WebClient send a very basic HTTP connection to the backend service.
+You must make any calls using the WebClient yet (i.e., hit the proxy endpoints), because these metrics
+are emitted lazily—only after actual connection usage.
+SECOND, if you still dont see any ACTUATOR METRICs, then please be advised that
+Reactor Netty publishes them to Micrometer’s global registry, while Spring Boot Actuator exposes its 
+own registry. They’re not bridged by default.
+QUICK fixes:
+Option A — easiest (Boot ≥ 3.2):
+```yaml
+management:
+  metrics:
+    use-global-registry: true
+
+```
+Option B — code bridge: create this bean
+```java
+@Bean
+MeterRegistryCustomizer<MeterRegistry> addBootRegistryToGlobal() {
+  return registry -> Metrics.addRegistry(registry);
+}
+```
 
 NB!!! By design the WebClient is fully asynchronous (none-blocking) client!
 
@@ -6238,36 +6265,195 @@ How to generate load above your QPS
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+                START of experiment to customize the WebClient -  23. Custom Connection Pool Settings
 
 
 
 23. Custom Connection Pool Settings
     By default, Reactor Netty’s connection pool size might be too small for high concurrency. You can tune max connections, pending
     acquisition, idle time, etc.
+
+Here’s the quick mental model for connection pooling with WebClient (Reactor Netty) and why you’d tune it:
+What is it?
+• Every outbound HTTP call needs a TCP connection. Creating/tearing these down is expensive (TCP handshake, TLS, congestion warm-up).
+• Reactor Netty keeps keep-alive connections in a pool so requests can reuse them instead of reconnecting each time.
+• The pool has limits: how many connections may be open, how many callers may wait for one, how long idle connections are kept, and when old ones are closed.
+
+How it fits WebClient
+• WebClient → Reactor Netty HttpClient → ConnectionProvider (the pool).
+• The pool is per host:port (so with load-balancing, each chosen instance ends up with its own sub-pool).
+• If you create several HttpClients with the same provider instance, they share the pool; different providers → separate pools.
+
+Why tune it?
+• High concurrency (lots of concurrent requests) can exhaust a small/default pool → callers block waiting for a connection (pending acquisition) → latency spikes/timeouts.
+• Long-lived calls (file uploads/streams) keep connections busy, reducing effective throughput unless you raise the max.
+• Server/NAT/file-descriptor limits: too large a pool can blow limits and cause resets/port exhaustion. You need the right size, not the biggest size.
+
+Key knobs (conceptually)
+• maxConnections: upper bound of simultaneous open connections per host. Raise for higher parallelism; keep reasonable to avoid server/socket limits.
+• pendingAcquireMaxCount: max callers allowed to wait for a connection. Acts like a back-pressure guard (fail fast if pool saturated).
+• pendingAcquireTimeout: how long a caller will wait to get a connection before failing.
+• maxIdleTime / maxLifeTime: evict idle/stale connections to avoid server closing them behind your back; trade off reuse vs freshness.
+• evictInBackground: periodic reaper to clean idle/stale connections without waiting for use.
+• LIFO/FIFO strategy**:** LIFO often improves cache locality/warm connections.
+• HTTP/2 note: H2 can multiplex many streams on one connection → you usually need fewer connections than with H1. Don’t just copy H1 pool sizes.
+
+Signals you need tuning
+• Rising pending acquisition counts/times.
+• Client timeouts despite server being healthy.
+• Many short-lived connections in server logs (poor reuse).
+• Latency improves when you temporarily raise the pool.
+
+How it interacts with your other pieces
+• Load balancer: pool is per resolved host:port; more instances → more sub-pools.
+• Rate limiter / bulkhead: use them to cap demand so you don’t drown the pool.
+• Circuit breaker: prevents hammering a sick instance, which also helps pool health.
+
+
+Let’s wire custom Reactor Netty connection pools and plug them into your two connectors. 
+I’m keeping original code/comments and only adding what’s needed; updated spots are clearly marked in
+the public class ApplicationBeanConfiguration.
+Add only these new lines on these places:
+```java
+private ConnectionProvider connectionProvider(String name) {
+    var p = props.getHttp().getPool();
+    return ConnectionProvider.builder(name)
+            .metrics(true) // <-- NEW: expose reactor.netty.connection.provider.* metrics
+
+
+
+
+    /* ── NEW: publish the two providers as beans so we can inject them ─────────────── */
+    @Bean("defaultConnectionProvider") // <-- NEW
+    ConnectionProvider defaultConnectionProvider() {
+        return connectionProvider("default-http-pool");
+    }
+
+    @Bean("uploadConnectionProvider") // <-- NEW
+    ConnectionProvider uploadConnectionProvider() {
+        return connectionProvider("upload-http-pool");
+    }
+
+
+    @Bean("defaultConnector")
+    ReactorClientHttpConnector clientHttpConnector(
+            @Qualifier("defaultConnectionProvider") ConnectionProvider provider
+    )
+    {
+        HttpClient http = HttpClient.create(provider)  //the provider must be of @Qualifier("defaultConnectionProvider")
+
+
+
+        @Bean("uploadConnector")
+        ReactorClientHttpConnector uploadClientHttpConnector(
+            @Qualifier("uploadConnectionProvider") ConnectionProvider provider
+    ) {
+        HttpClient http = HttpClient.create(provider)  //the provider must be of  @Qualifier("uploadConnectionProvider")
+
+
+
+```
+
+How to test!?
+First, always when using metrics for Reactor Netty, make sure to first make a single simple Request
+from the WebClient to the backend-service. Only after that the metric for Reactor Netty will be
+available in the list:
+GET http://localhost:8080/actuator/metrics so:
+```text
+        "process.uptime",
+        "reactor.netty.bytebuf.allocator.active.direct.memory",
+        "reactor.netty.bytebuf.allocator.active.heap.memory",
+        "reactor.netty.bytebuf.allocator.chunk.size",
+        "reactor.netty.bytebuf.allocator.direct.arenas",
+        "reactor.netty.bytebuf.allocator.heap.arenas",
+        "reactor.netty.bytebuf.allocator.normal.cache.size",
+        "reactor.netty.bytebuf.allocator.small.cache.size",
+        "reactor.netty.bytebuf.allocator.threadlocal.caches",
+        "reactor.netty.bytebuf.allocator.used.direct.memory",
+        "reactor.netty.bytebuf.allocator.used.heap.memory",
+        "reactor.netty.connection.provider.active.connections",
+        "reactor.netty.connection.provider.idle.connections",
+        "reactor.netty.connection.provider.max.connections",
+        "reactor.netty.connection.provider.max.pending.connections",
+        "reactor.netty.connection.provider.pending.connections",
+        "reactor.netty.connection.provider.pending.connections.time",
+        "reactor.netty.connection.provider.total.connections",
+        "reactor.netty.eventloop.pending.tasks",
+        "reactor.netty.http.client.connect.time",
+        "reactor.netty.http.client.data.received",
+        "reactor.netty.http.client.data.received.time",
+        "reactor.netty.http.client.data.sent",
+        "reactor.netty.http.client.data.sent.time",
+        "reactor.netty.http.client.response.time",
+        "resilience4j.ratelimiter.available.permissions",
+```
+And yuu can query them so:
+/actuator/metrics/reactor.netty.connection.provider.active.connections
+/actuator/metrics/reactor.netty.connection.provider.idle.connections
+/actuator/metrics/reactor.netty.connection.provider.pending.connections
+
+Examples:
+List names:
+GET http://localhost:8080/actuator/metrics
+
+Active connections:
+GET http://localhost:8080/actuator/metrics/reactor.netty.connection.provider.active.connections
+
+Idle connections:
+GET http://localhost:8080/actuator/metrics/reactor.netty.connection.provider.idle.connections
+
+Pending acquisitions:
+GET http://localhost:8080/actuator/metrics/reactor.netty.connection.provider.pending.connections
+
+Use the response’s availableTags to see which tag keys are present (often a pool id/name like default-http-pool / upload-http-pool) and then query with ?tag=id:default-http-pool (or whatever the tag key is called in your build).
+
+That’s it—you now have explicit, per-client connection pools tuned for your traffic patterns.
+
+
+
+
+
+                END of experiment to customize the WebClient -  23. Custom Connection Pool Settings
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 24. Custom Codec for XML, YAML, or Protobuf
     Maybe you’re talking to a legacy service that uses XML or a partner that uses Protobuf. You need to register an additional codec

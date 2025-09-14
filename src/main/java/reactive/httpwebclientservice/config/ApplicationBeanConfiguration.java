@@ -53,9 +53,6 @@ import java.time.Duration;
 import java.util.List;
 
 import io.netty.handler.ssl.SslContextBuilder;
-import reactor.netty.http.HttpProtocol;
-import reactor.netty.http.client.HttpClient;
-import reactor.netty.tcp.SslProvider;
 
 import javax.net.ssl.SSLException;
 
@@ -78,6 +75,7 @@ public class ApplicationBeanConfiguration {
     private ConnectionProvider connectionProvider(String name) {
         var p = props.getHttp().getPool();
         return ConnectionProvider.builder(name)
+                .metrics(true) // <-- NEW: expose reactor.netty.connection.provider.* metrics
                 .maxConnections(p.getMaxConnections())
                 .pendingAcquireTimeout(p.getPendingAcquireTimeout())
                 .maxIdleTime(p.getMaxIdle())
@@ -85,6 +83,17 @@ public class ApplicationBeanConfiguration {
                 .evictInBackground(p.getEvictInBackground())
                 .lifo() // prefer recently-used
                 .build();
+    }
+
+    /* ── NEW: publish the two providers as beans so we can inject them ─────────────── */
+    @Bean("defaultConnectionProvider") // <-- NEW
+    ConnectionProvider defaultConnectionProvider() {
+        return connectionProvider("default-http-pool");
+    }
+
+    @Bean("uploadConnectionProvider") // <-- NEW
+    ConnectionProvider uploadConnectionProvider() {
+        return connectionProvider("upload-http-pool");
     }
 
     /* ── NEW: apply protocol + TLS/H2 settings + TCP keepalive + logging ──── */
@@ -144,9 +153,11 @@ public class ApplicationBeanConfiguration {
 
     /** Low-level Reactor Netty client with timeouts. */
     @Bean("defaultConnector")
-    ReactorClientHttpConnector clientHttpConnector()
+    ReactorClientHttpConnector clientHttpConnector(
+            @Qualifier("defaultConnectionProvider") ConnectionProvider provider
+    )
     {
-        HttpClient http = HttpClient.create()
+        HttpClient http = HttpClient.create(provider)
                 // CONNECT timeout (TCP handshake)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
 
@@ -169,9 +180,9 @@ public class ApplicationBeanConfiguration {
 
     // NEW: a more tolerant connector specifically for VERY large uploads.
     @Bean("uploadConnector")
-    ReactorClientHttpConnector uploadClientHttpConnector() {
-        ConnectionProvider provider = connectionProvider("upload-pool");
-
+    ReactorClientHttpConnector uploadClientHttpConnector(
+            @Qualifier("uploadConnectionProvider") ConnectionProvider provider
+    ) {
         HttpClient http = HttpClient.create(provider)
                 .wiretap(true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
