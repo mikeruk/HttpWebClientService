@@ -37,7 +37,12 @@ dservice:
 #  dservice: is not special to Spring. It’s simply a grouping key (a map) under which you put your settings.
 #  Under dservice:, you create a property called base-url whose value is http://localhost:8081.
 #  Later, your code will read user.base-url instead of having builder.baseUrl("http://localhost:8081") hard-coded.
-
+    wiretap:
+      format: TEXTUAL           # SIMPLE | TEXTUAL | HEX (aka HEX_DUMP)
+      default:
+        enabled: false          # leave normal traffic quiet
+      upload:
+        enabled: true           # only noisy when debugging uploads
 
 logging:
   level:
@@ -47,5 +52,8 @@ logging:
     http.trace: DEBUG    # per-request (X-Debug-Log=true) logs go here
     reactive.httpwebclientservice.filters.HttpLoggingFilter: DEBUG
     reactor.netty.http.client.HttpClient: DEBUG # optional raw byte wiretap (Netty):
+    # Narrow scope: only log the upload connector’s wiretap
+    reactor.netty.http.client.HttpClient.upload: DEBUG
+    reactor.netty.http.client.HttpClient.default: INFO
 
 

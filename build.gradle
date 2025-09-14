@@ -55,7 +55,8 @@ dependencies {
     // YAML
     implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml'
     // Protobuf runtime (for generated message classes)
-    implementation 'com.google.protobuf:protobuf-java'  // Protobuf
+    implementation 'com.google.protobuf:protobuf-java:3.25.3' // or a current 3.25.x // Protobuf
+
 
 
 }

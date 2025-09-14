@@ -1150,7 +1150,7 @@ private boolean isIdempotent(ClientRequest req) {
     }
 
 ```
-Why is it waht it does? 
+Why is it what it does? 
 By default all POST requests in the WebClient do not apply the retry functionality as defined above.
 BUT you can still make a certain POST request to be executed with Retries! The filter will be checking for POST
 request with Header:.header("Idempotency-Key", "user:42") , but you also have to customize that particular request, 
@@ -5055,6 +5055,10 @@ Simply add a second filter a little bit lower in the list, like so:
 
 ```
 
+NB!! Adding logging filter twice is very bad idea, because later it will break other functionality.
+Add it twice only for testing or debuggnig purposes!
+Later for other tasks I will remove one of the logging filters.
+
 Now when postman client sends this:
 GET http://localhost:8080/proxy/user-with-data/2?X-Debug-Log=true (note: the parameter ?X-Debug-Log=true does not play any role here )
 , this is logged:
@@ -6518,34 +6522,291 @@ That’s it — your WebClient can now automatically (de)serialize XML, YAML, an
 
 
 
+                START of experiment to customize the WebClient -  25. Conditional Circuit Breaker Per Endpoint
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+This task will be skipped now. It's not that critical now. And the project already implements such or similar functionality.
 
 25. Conditional Circuit Breaker Per Endpoint
     Perhaps you trust /user/{id} to be quick, but /user-with-data/{id} is slow (joins multiple tables). You might want a tighter
     circuit breaker on the slow path (e.g., trip after 3 failures), but leave the simple GET alone.
 
+
+What you have:
+• Resilience4j is wired in and applied via a Resilience4jFilter.
+• 4xx are not counted as failures (your ErrorMappingFilter + CB recordException logic).
+• Metrics infra is in place.
+What’s missing for “per-endpoint” CB:
+1. Name the breaker per route, not per service (right now you use just props.getServiceId()).
+2. Provide a stricter CB config for the slow endpoint and register it in the registry.
+3. (Optional) Bind CB metrics explicitly so you can see both breakers.
+
+
+
+
+                END of experiment to customize the WebClient -  25. Conditional Circuit Breaker Per Endpoint
+
+
+
+
+                START of experiment to customize the WebClient -  26. Dynamic Connection Pool Adjustment at Runtime
+
+
+
+
+This task will be skipped now. It's not that critical now. And the project already implements such or similar functionality.
+
+
 26. Dynamic Connection Pool Adjustment at Runtime
     Maybe you want to throttle performance during off-peak hours (e.g. only 10 connections at night) and allow more during business
     hours (e.g. 100 connections). You could expose an actuator endpoint to tweak connection pool sizes on the fly.
 
+
+    
+
+                END of experiment to customize the WebClient -  26. Dynamic Connection Pool Adjustment at Runtime
+
+
+
+
+
+                START of experiment to customize the WebClient -  27. Per-Client Logging Level (Wiretap)
+
+
+        NB !!!!
+
+        Caveats
+        • Wiretap logs raw bytes (post-TLS decryption). Do not enable in prod or with secrets in flight.
+        • It’s expensive; keep it scoped to the one connector you’re investigating.
+
+        NB !!!!
+
+
+
 27. Per-Client Logging Level (Wiretap)
     If you want to log TCP-level details (headers, wire bytes), Reactor Netty’s “wiretap” can dump low-level frames. Useful only
     when debugging SSL handshakes or subtle protocol issues.
+
+
+Wiretap = Netty’s byte-level logging. We’ll make it per-connector and toggleable from YAML.
+What you’ll add
+• Per-client (default vs upload) wiretap switches.
+• Pickable format: SIMPLE (headers), TEXTUAL (decoded text), or HEX (hex dump).
+• Separate SLF4J categories so you can enable logs for one client without blasting all.
+
+Code changes (in ApplicationBeanConfiguration)
+Add imports:
+
+```java
+import io.netty.handler.logging.LogLevel;
+import reactor.netty.transport.logging.AdvancedByteBufFormat;
+import org.springframework.beans.factory.annotation.Value;
+
+```
+
+Add properties (fields):
+```java
+
+@Value("${dservice.http.wiretap.format:SIMPLE}")
+private String wiretapFormat; // SIMPLE | TEXTUAL | HEX / HEX_DUMP
+
+@Value("${dservice.http.wiretap.default.enabled:false}")
+private boolean wiretapDefaultEnabled;
+
+@Value("${dservice.http.wiretap.upload.enabled:false}")
+private boolean wiretapUploadEnabled;
+
+```
+
+Helper to map format:
+```java
+private AdvancedByteBufFormat wiretapFmt() {
+    String f = wiretapFormat == null ? "SIMPLE" : wiretapFormat.toUpperCase();
+    return switch (f) {
+        case "HEX", "HEX_DUMP" -> AdvancedByteBufFormat.HEX_DUMP;
+        case "TEXT", "TEXTUAL" -> AdvancedByteBufFormat.TEXTUAL;
+        default -> AdvancedByteBufFormat.SIMPLE;
+    };
+}
+
+
+```
+Default connector — add wiretap (remove none here; you currently don’t wiretap default)
+update that file:
+the new things are marked 
+```java
+@Bean("defaultConnector")
+ReactorClientHttpConnector clientHttpConnector(
+                @Qualifier("defaultConnectionProvider") ConnectionProvider provider) {
+
+    HttpClient http = HttpClient.create(provider)
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5_000)
+            .responseTimeout(Duration.ofSeconds(100))
+            .doOnConnected(conn -> conn
+                    .addHandlerLast(new ReadTimeoutHandler(30))
+                    .addHandlerLast(new WriteTimeoutHandler(10)))
+            .metrics(true, uri -> uri);
+
+    http = applyHttpVersionAndKeepAlive(http, "defaultConnector");
+
+    // NEW: per-client wiretap
+    if (wiretapDefaultEnabled) {
+        http = http.wiretap(
+                "reactor.netty.http.client.HttpClient.default",
+                LogLevel.DEBUG,
+                wiretapFmt()
+        );
+    }
+
+    return new ReactorClientHttpConnector(http);
+}
+
+
+```
+
+Upload connector — replace .wiretap(true) with conditional advanced wiretap
+
+```java
+@Bean("uploadConnector")
+ReactorClientHttpConnector uploadClientHttpConnector(
+        @Qualifier("uploadConnectionProvider") ConnectionProvider provider) {
+
+    HttpClient http = HttpClient.create(provider)
+        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
+        .responseTimeout(Duration.ofHours(24))
+        .doOnConnected(conn -> conn
+            .addHandlerLast(new ReadTimeoutHandler(0))
+            .addHandlerLast(new WriteTimeoutHandler(0)))
+        .metrics(true, uri -> uri);
+
+    http = applyHttpVersionAndKeepAlive(http, "uploadConnector");
+
+    // NEW: per-client wiretap
+    if (wiretapUploadEnabled) {
+        http = http.wiretap(
+            "reactor.netty.http.client.HttpClient.upload",
+            LogLevel.DEBUG,
+            wiretapFmt()
+        );
+    }
+
+    return new ReactorClientHttpConnector(http);
+}
+
+
+```
+Note: I intentionally removed your previous .wiretap(true) to avoid blanket logging; the advanced form gives you category + format control.
+
+
+application.yml (toggle it per client)
+```yml
+dservice:
+  http:
+    wiretap:
+      format: TEXTUAL           # SIMPLE | TEXTUAL | HEX (aka HEX_DUMP)
+      default:
+        enabled: false          # leave normal traffic quiet
+      upload:
+        enabled: true           # only noisy when debugging uploads
+
+```
+
+Logging levels (per-category)
+
+Use the exact categories we set above:
+
+```yml
+logging:
+  level:
+    # Narrow scope: only log the upload connector’s wiretap
+    reactor.netty.http.client.HttpClient.upload: DEBUG
+    reactor.netty.http.client.HttpClient.default: INFO
+    # Make sure the parent isn’t forcing DEBUG for all:
+    reactor.netty.http.client.HttpClient: INFO
+
+```
+    Why it matters whether parent -  reactor.netty.http.client.HttpClient: INFO - isn’t forcing DEBUG for all? 
+Because the child logger (e.g. ...HttpClient.upload) inherits its level unless you set the child explicitly.
+• Set parent to INFO → only the categories you explicitly turn on (e.g. ...HttpClient.upload: DEBUG) will be chatty.
+• If parent is DEBUG, then every child without its own level becomes DEBUG too (lots of noisy Netty logs).
+You can still override specific children (e.g. set ...HttpClient.default: INFO), but many other Netty categories will remain DEBUG.
+
+In my case, because of earlier tasks, its already in DEBUG: reactor.netty.http.client.HttpClient: DEBUG
+but I wont change it. It won't hurt if its noisy.
+
+Knowing this, then how to use it?
+• Flip enabled in YAML and set the matching logger category to DEBUG.
+• TEXTUAL is usually friendlier than raw hex; use HEX if you’re chasing binary frames.
+• For TLS handshake internals, also set:
+```yml
+logging.level.io.netty.handler.ssl: DEBUG
+
+```
+(only while debugging!)
+Caveats
+• Wiretap logs raw bytes (post-TLS decryption). Do not enable in prod or with secrets in flight.
+• It’s expensive; keep it scoped to the one connector you’re investigating.
+
+How to verify
+1. Call any endpoint using uploadWebClient → you should see log lines with logger wiretap.upload containing WRITE/READ plus headers and body bytes (HTTP/1.1) or frame info (HTTP/2).
+2. Call via the normal WebClient → no wiretap logs should appear.
+3. Flip wiretap.upload to INFO to silence it without code changes.
+⚠️ Wiretap logs bodies; avoid in prod or mask secrets.
+
+4. Unfortunately testing with: http://localhost:8080/proxy/upload-small?path=/......./small.bin
+ throws error: java.lang.IllegalStateException  , because I have filters added here: 
+
+```java
+.filters(list -> {
+                    // ───────────────── ORDER MATTERS ─────────────────
+                    // Put RATE LIMITING OUTERMOST → it gates everything (retry, CB, etc.)
+                    list.add(0, rateLimitFilter);  // <-- NEW (outermost)
+                    // Put logging fairly outer so you see what's retried, but AFTER request-mutation,
+                    // so headers (auth/correlation) appear in logs.
+                    //list.add(loggingFilter); //- this is added below again. It must be added only once, not twice.
+                    // We want the CircuitBreaker/Bulkhead to wrap EVERYTHING (including retry + error mapping),
+                    // and we want retry to happen INSIDE the breaker (so one logical call is counted once).
+                    // So we insert r4jFilter at index 0 (OUTERMOST).
+                    list.add(0, r4jFilter);          // <-- NEW (outermost)
+
+                    // OUTERMOST (was) -> now second outermost(now the r4jFilter is OUTERMOST)
+                    list.add(errorMapping);
+
+                    // request-mutating filters should run BEFORE retry (so each retry has headers)
+                    // mutate requests, then allow retry to re-run with headers
+                    list.add(correlationFilter);
+                    list.add(authFilter);
+                    list.add(cookieJarFilter); // <-- NEW (Task 18)
+                    // ⬇️ add cookies here so mutations above are already applied;
+                    // and retries below will include cookies on each attempt
+                    list.add(cookieFilter);
+                    list.add(routeAwareFilter);   // <— NEW: conditional header logic lives with other mutators
+                    list.add(loggingFilter); // SECOND time added same logging filter, to ensure any mutated requests are alo logged
+                    // INNER
+                    list.add(retryFilter);
+                });
+    }
+```
+And these filter break it. I cannot have two filtern. But even if I remove one, it still breaks.
+
+
+
+
+                END of experiment to customize the WebClient -  27. Per-Client Logging Level (Wiretap)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 28. Implementing a Custom “Fallback to Cache” on 404
     If your user data is sometimes stale, you want to first check a local cache. If the remote call returns 404, then you serve from

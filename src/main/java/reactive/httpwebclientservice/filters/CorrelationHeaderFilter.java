@@ -7,6 +7,9 @@ import reactor.core.publisher.Mono;
 
 public class CorrelationHeaderFilter implements ExchangeFilterFunction {
 
+    private static final String LOGGED = HttpLoggingFilter.class.getName()+".logged";
+
+
     @Override
     public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
         return Mono.deferContextual(ctxView -> {

@@ -25,7 +25,6 @@ import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.handler.timeout.WriteTimeoutHandler;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.cloud.client.loadbalancer.LoadBalanced;
-import org.springframework.cloud.client.loadbalancer.reactive.ReactorLoadBalancerExchangeFilterFunction;
 import org.springframework.cloud.loadbalancer.config.LoadBalancerZoneConfig;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -56,6 +55,11 @@ import io.netty.handler.ssl.SslContextBuilder;
 
 import javax.net.ssl.SSLException;
 
+import io.netty.handler.logging.LogLevel;
+import reactor.netty.transport.logging.AdvancedByteBufFormat;
+import org.springframework.beans.factory.annotation.Value;
+
+
 
 @Configuration
 public class ApplicationBeanConfiguration {
@@ -64,6 +68,16 @@ public class ApplicationBeanConfiguration {
             org.slf4j.LoggerFactory.getLogger(ApplicationBeanConfiguration.class);
 
     private final DserviceClientProperties props;
+
+    @Value("${dservice.http.wiretap.format:SIMPLE}")
+    private String wiretapFormat; // SIMPLE | TEXTUAL | HEX / HEX_DUMP
+
+    @Value("${dservice.http.wiretap.default.enabled:false}")
+    private boolean wiretapDefaultEnabled;
+
+    @Value("${dservice.http.wiretap.upload.enabled:false}")
+    private boolean wiretapUploadEnabled;
+
 
 
     // Constructor injection of our properties holder
@@ -175,6 +189,15 @@ public class ApplicationBeanConfiguration {
         /* NEW: apply protocol, TLS/H2 and TCP keepalive */
         http = applyHttpVersionAndKeepAlive(http, "defaultConnector");
 
+
+        // NEW: per-client wiretap
+        if (wiretapDefaultEnabled) {
+            http = http.wiretap(
+                    "reactor.netty.http.client.HttpClient.default",
+                    LogLevel.DEBUG,
+                    wiretapFmt()
+            );
+        }
         return new ReactorClientHttpConnector(http);
     }
 
@@ -184,7 +207,6 @@ public class ApplicationBeanConfiguration {
             @Qualifier("uploadConnectionProvider") ConnectionProvider provider
     ) {
         HttpClient http = HttpClient.create(provider)
-                .wiretap(true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
                 .responseTimeout(Duration.ofHours(24))
                 .doOnConnected(conn -> conn
@@ -194,6 +216,15 @@ public class ApplicationBeanConfiguration {
 
         /* NEW: apply protocol, TLS/H2 and TCP keepalive */
         http = applyHttpVersionAndKeepAlive(http, "uploadConnector");
+
+        // NEW: per-client wiretap
+        if (wiretapUploadEnabled) {
+            http = http.wiretap(
+                    "reactor.netty.http.client.HttpClient.upload",
+                    LogLevel.DEBUG,
+                    wiretapFmt()
+            );
+        }
 
         return new ReactorClientHttpConnector(http);
     }
@@ -481,7 +512,7 @@ public class ApplicationBeanConfiguration {
                     list.add(0, rateLimitFilter);  // <-- NEW (outermost)
                     // Put logging fairly outer so you see what's retried, but AFTER request-mutation,
                     // so headers (auth/correlation) appear in logs.
-                    list.add(loggingFilter);
+                    //list.add(loggingFilter); //- this is added below again. It must be added only once, not twice.
                     // We want the CircuitBreaker/Bulkhead to wrap EVERYTHING (including retry + error mapping),
                     // and we want retry to happen INSIDE the breaker (so one logical call is counted once).
                     // So we insert r4jFilter at index 0 (OUTERMOST).
@@ -579,5 +610,16 @@ public class ApplicationBeanConfiguration {
     RateLimiter backendServiceRateLimiter(RateLimiterRegistry registry, DserviceClientProperties props) {
         return registry.rateLimiter(props.getServiceId()); // e.g. "backend-service"
     }
+
+
+    private AdvancedByteBufFormat wiretapFmt() {
+        String f = wiretapFormat == null ? "SIMPLE" : wiretapFormat.toUpperCase();
+        return switch (f) {
+            case "HEX", "HEX_DUMP" -> AdvancedByteBufFormat.HEX_DUMP;
+            case "TEXT", "TEXTUAL" -> AdvancedByteBufFormat.TEXTUAL;
+            default -> AdvancedByteBufFormat.SIMPLE;
+        };
+    }
+
 
 }
