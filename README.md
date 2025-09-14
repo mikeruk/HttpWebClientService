@@ -5854,17 +5854,416 @@ Keep your upload connector lenient (long timeouts, no write idle) and your defau
 
 
 
-
-
-
-
-
+                START of experiment to customize the WebClient -  22. Custom Request Throttling (Rate Limiting)
 
 
 
 22. Custom Request Throttling (Rate Limiting)
     To avoid overwhelming your backend (or to respect the third-party’s rate limits), you might want to throttle outgoing
     requests to, say, 10 QPS.
+
+
+        First let's explain what this is all about. Here’s the quick mental model:
+
+What is throttling?
+• Throttling / rate limiting = deliberately slowing or capping how many requests you send over time (e.g., no more than 10 per second).
+• It’s done client-side to protect your backend (or to respect a third-party’s published limits), and server-side to protect their service.
+
+Why do it?
+• Protect backends from traffic spikes and self-inflicted DDoS.
+• Stay within third-party quotas (avoid 429s, bans, extra costs).
+• Stabilize latency (smooth bursts), reduce cascading failures.
+• Fairness: share capacity among tenants/users.
+
+Key terms (super short)
+• QPS: Queries Per Second—a throughput cap (e.g., 10 QPS).
+• Burst: short spikes allowed above the steady rate (e.g., 10 QPS with burst 20).
+• Token bucket: common algorithm—tokens drip in at a rate; each request consumes one; if empty, you wait or drop.
+• Leaky bucket: smooth, constant outflow; buffers bursts.
+• 429 Too Many Requests: server telling you it rate-limited you (often with Retry-After header).
+• Global vs per-key: limit everything together (global), or per user/API key/route.
+• Queue vs shed: when over limit, either queue (adds latency) or shed/drop (fail fast).
+
+Throttling vs other controls
+• Throttling: controls rate over time.
+• Concurrency limits (bulkhead): controls how many are in-flight at once.
+• Circuit breaker: opens after repeated failures to avoid hammering a bad endpoint.
+• Retry: tries again after failure—must be coordinated with throttling to avoid stampedes.
+
+Where to apply (for WebClient)
+• Per-client (all calls), per-route (/user/** tighter), or per-tenant (header/API key).
+• In a single instance you can keep counters in-memory; in a cluster you need a shared limiter (e.g., Redis/Bucket4j/Resilience4j with distributed state) or limit per instance.
+
+Typical policies
+• Steady rate: 10 QPS, no bursts.
+• Bursty: 10 QPS with burst = 20 (bucket size 20).
+• Windowed: 600 requests / minute (rolling or fixed windows).
+• Server-hint-aware: back off if you see 429 and honor Retry-After.
+
+When you’re ready, I can show two idiomatic implementations for WebClient:
+1. Resilience4j RateLimiter (simple, in-JVM, integrates with Reactor), and
+2. Bucket4j (more flexible; can be local or Redis-backed for cluster-wide limits).
+
+
+Let’s wire client-side throttling into your existing WebClient using Resilience4j RateLimiter. 
+We’ll keep it per-client (and optionally per-route), outermost in your filter chain so it gates 
+everything (retry/CB/etc.)
+```gradle
+
+// build.gradle
+dependencies {
+    // …existing deps…
+    implementation 'io.github.resilience4j:resilience4j-ratelimiter:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-reactor:2.2.0'   // already present (keep)
+    implementation 'io.github.resilience4j:resilience4j-micrometer:2.2.0' // for metrics (you already have)
+}
+```
+
+1) NEW filter: RateLimitingFilter.java
+
+```java
+package reactive.httpwebclientservice.filters;
+
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
+import io.github.resilience4j.reactor.ratelimiter.operator.RateLimiterOperator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Mono;
+
+import java.util.Objects;
+import java.util.function.Function;
+
+/**
+ * Outermost filter that throttles outgoing requests using a Resilience4j RateLimiter.
+ * Choose the limiter key (global / per-service / per-route) via keySelector.
+ */
+public class RateLimitingFilter implements ExchangeFilterFunction {
+
+    private static final Logger log = LoggerFactory.getLogger(RateLimitingFilter.class);
+
+    private final RateLimiterRegistry registry;
+    private final Function<ClientRequest, String> keySelector;
+
+    public RateLimitingFilter(RateLimiterRegistry registry,
+                              Function<ClientRequest, String> keySelector) {
+        this.registry = Objects.requireNonNull(registry);
+        this.keySelector = Objects.requireNonNull(keySelector);
+    }
+
+    @Override
+    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+        String key = keySelector.apply(request);
+        RateLimiter rl = registry.rateLimiter(key); // creates or retrieves
+
+        // Use defer so permission is attempted BEFORE the real exchange starts.
+        return Mono.defer(() -> next.exchange(request))
+                .transformDeferred(RateLimiterOperator.of(rl))
+                .doOnSubscribe(s -> log.debug("Rate limiting key='{}' {} {}", key, request.method(), request.url()));
+    }
+}
+
+
+
+```
+
+2) Register a RateLimiterRegistry and plug the filter (keep your original code, add NEW blocks)
+```java
+
+// ApplicationBeanConfiguration.java  (add imports)
+import io.github.resilience4j.ratelimiter.*;
+import reactive.httpwebclientservice.filters.RateLimitingFilter;
+
+// …inside your @Configuration class…
+
+// ───────────────────────────────────────────────────────────────
+// NEW: Central RateLimiter registry (code-based config, no YAML).
+//   Example policy: ≤10 QPS with burst 20, and wait up to 100 ms
+//   to acquire a permit (otherwise fail fast).
+//   Tune these numbers as you need, or externalize to properties.
+// ───────────────────────────────────────────────────────────────
+@Bean
+RateLimiterRegistry rateLimiterRegistry() {
+    RateLimiterConfig cfg = RateLimiterConfig.custom()
+            .limitRefreshPeriod(java.time.Duration.ofSeconds(1))  // "per second"
+            .limitForPeriod(10)                                   // 10 permits added each second
+            .timeoutDuration(java.time.Duration.ofMillis(100))    // wait up to 100ms for a token
+            .build();
+    return RateLimiterRegistry.of(cfg);
+}
+
+
+```
+
+Now, where you assemble the loadBalancedWebClientBuilder:
+
+```java
+
+@Bean
+@LoadBalanced
+public WebClient.Builder loadBalancedWebClientBuilder(
+        @Qualifier("defaultConnector") ReactorClientHttpConnector connector,
+        Jackson2ObjectMapperBuilder jackson2ObjectMapperBuilder,
+        ObservationRegistry observationRegistry,
+        ClientRequestObservationConvention webClientObservationConvention,
+        CircuitBreakerRegistry circuitBreakerRegistry,
+        BulkheadRegistry bulkheadRegistry,
+        // ───────────── NEW ─────────────
+        RateLimiterRegistry rateLimiterRegistry
+) {
+    // … your existing encoder/decoder setup, filters, etc …
+
+    // existing:
+    var retryFilter       = new RetryBackoffFilter(2, Duration.ofSeconds(1), Duration.ofSeconds(1), 0.0);
+    var errorMapping      = new ErrorMappingFilter();
+    var correlationFilter = new CorrelationHeaderFilter();
+    var authFilter        = new AuthHeaderFilter(props::getAuthToken);
+    var r4jFilter         = new Resilience4jFilter(circuitBreakerRegistry, bulkheadRegistry, req -> props.getServiceId());
+    var loggingFilter     = new HttpLoggingFilter(64 * 1024);
+
+    // ───────────────────────────────────────────────────────────────
+    // NEW: Rate limiter filter.
+    // Key strategy options:
+    //  - GLOBAL single limiter: req -> "global"
+    //  - Per serviceId (good default): req -> props.getServiceId()
+    //  - Per route: req -> req.method().name() + " " + req.url().getPath()
+    //  - Per tenant from header: req -> "tenant:" + Optional.ofNullable(req.headers().getFirst("X-Tenant")).orElse("anon")
+    // Pick one:
+    // ───────────────────────────────────────────────────────────────
+    var rateLimitFilter = new RateLimitingFilter(
+            rateLimiterRegistry,
+            req -> props.getServiceId() // ← per-backend-service limiter (recommended here)
+    );
+
+    return WebClient
+            .builder()
+            .clientConnector(connector)
+            .observationRegistry(observationRegistry)
+            .observationConvention(webClientObservationConvention)
+            .codecs(c -> {
+                // …your existing codecs including maxInMemorySize…
+                c.defaultCodecs().jackson2JsonEncoder(encoder);
+                c.defaultCodecs().jackson2JsonDecoder(decoder);
+                c.defaultCodecs().maxInMemorySize(256 * 1024);
+            })
+            .filters(list -> {
+                // ───────────────── ORDER MATTERS ─────────────────
+                // Put RATE LIMITING OUTERMOST → it gates everything (retry, CB, etc.)
+                list.add(0, rateLimitFilter);  // <-- NEW (outermost)
+
+                // Your existing chain
+                list.add(loggingFilter);
+                list.add(0, r4jFilter);
+                list.add(errorMapping);
+                list.add(correlationFilter);
+                list.add(authFilter);
+                list.add(retryFilter);
+            });
+}
+
+
+```
+Optional: also limit the upload client separately (often a different budget):
+Here is example code, but I do not implement it now, this is this as example:
+```java
+@Bean
+@Qualifier("uploadWebClient")
+public WebClient uploadWebClient(
+        WebClient.Builder lbBuilder,
+        @Qualifier("uploadConnector") ReactorClientHttpConnector uploadConnector,
+        ObservationRegistry observationRegistry,
+        ClientRequestObservationConvention webClientObservationConvention,
+        DserviceClientProperties props,
+        // ───────────── NEW ─────────────
+        RateLimiterRegistry rateLimiterRegistry
+) {
+    // Separate limiter bucket for uploads (e.g., 2 QPS)
+    RateLimiterConfig uploadCfg = RateLimiterConfig.custom()
+            .limitRefreshPeriod(Duration.ofSeconds(1))
+            .limitForPeriod(2)
+            .timeoutDuration(Duration.ofMillis(100))
+            .build();
+    rateLimiterRegistry.rateLimiter("upload-" + props.getServiceId(), uploadCfg);
+
+    var uploadRlFilter = new RateLimitingFilter(
+            rateLimiterRegistry,
+            req -> "upload-" + props.getServiceId()
+    );
+
+    return lbBuilder.clone()
+            .clientConnector(uploadConnector)
+            .baseUrl("http://" + props.getServiceId())
+            .observationRegistry(observationRegistry)
+            .observationConvention(webClientObservationConvention)
+            .filters(list -> {
+                // gate uploads too
+                list.add(0, uploadRlFilter);
+            })
+            .build();
+}
+
+```
+
+3) Map “over limit” to a clean 429 (optional but nice)
+
+If you want pretty 429s back to Postman:
+```java
+
+// GlobalErrorHandler.java  (add one more handler)
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+
+@RestControllerAdvice
+public class GlobalErrorHandler {
+
+    // …existing @ExceptionHandler(ApiException.class) …
+
+    // ─────────────────────────────────────────────
+    // NEW: when rate limiter denies a request
+    // ─────────────────────────────────────────────
+    @ExceptionHandler(RequestNotPermitted.class)
+    public ResponseEntity<String> handleRatelimit(RequestNotPermitted ex) {
+        return ResponseEntity.status(429).body("Client-side rate limit exceeded");
+    }
+}
+
+```
+
+(If you prefer to reuse your TooManyRequestsException, you could .onErrorMap(RequestNotPermitted.class, e -> new TooManyRequestsException(...)) 
+inside your ErrorMappingFilter, but the advice above is simpler.)
+
+
+4) How to test quickly?
+Temporarily set rate limit down to 1 or 2, like so:
+```java
+    @Bean
+    RateLimiterRegistry rateLimiterRegistry() {
+        RateLimiterConfig cfg = RateLimiterConfig.custom()
+                .limitRefreshPeriod(java.time.Duration.ofSeconds(1))  
+                .limitForPeriod(1)                      //<<--  1 permits added each second
+                .timeoutDuration(java.time.Duration.ofMillis(100))    
+                .build();
+        return RateLimiterRegistry.of(cfg);
+    }
+```
+Then open postman client and manually start clicking fast to send requests to any URL, like:
+http://localhost:8080/proxy/user/5?X-Debug-Log=true
+Eventually you will get this response:
+429 Too Many Requests
+Client-side rate limit exceeded
+
+Tested it with success.
+
+
+        Metrics (since you have micrometer + resilience4j):
+
+If you like more professional data, here you can try to use metrics:
+Add a brand new bean so:
+```java
+ @Bean
+MeterBinder rateLimiterMetricsBinder(RateLimiterRegistry rlRegistry) {
+    // This publishes:
+    //  - resilience4j.ratelimiter.calls
+    //  - resilience4j.ratelimiter.available.permissions
+    //  - resilience4j.ratelimiter.waiting.threads
+    return TaggedRateLimiterMetrics.ofRateLimiterRegistry(rlRegistry);
+}
+
+// Eagerly create a named limiter so meters can be bound immediately
+@Bean
+RateLimiter backendServiceRateLimiter(RateLimiterRegistry registry, DserviceClientProperties props) {
+    return registry.rateLimiter(props.getServiceId()); // e.g. "backend-service"
+}
+```
+The MeterBinder rateLimiterMetricsBinder(RateLimiterRegistry rlRegistry) from above allows you to query this Endpoint:
+GET http://localhost:8080/actuator/metrics
+, but if you like to be able to also query this endpoint below:
+GET http://localhost:8080/actuator/metrics/resilience4j.ratelimiter.available.permissions
+, then you must have also the RateLimiter backendServiceRateLimiter(RateLimiterRegistry registry, DserviceClientProperties props)
+as shown above. And then you see the result - it confirms that we have set limits:
+```json
+{
+    "name": "resilience4j.ratelimiter.available.permissions",
+    "description": "The number of available permissions",
+    "measurements": [
+        {
+            "statistic": "VALUE",
+            "value": 10.0
+        }
+    ],
+    "availableTags": [
+        {
+            "tag": "app",
+            "values": [
+                "HttpWebClientService"
+            ]
+        },
+        {
+            "tag": "name",
+            "values": [
+                "backend-service"
+            ]
+        }
+    ]
+}
+```
+
+
+
+That’s it! 
+You now have per-service rate limiting guarding every WebClient call, with an easy path to switch to per-route or per-tenant keys if you want finer control.
+
+BUT if you like to generate QPS above the limit, then you need to use tools like:
+How to generate load above your QPS
+   Pick any:
+   a) hey (nice and simple)
+   hey -z 10s -q 100 -c 20 "http://localhost:8080/proxy/user/5"
+   • -q 100 = 100 requests/second target
+   • -c 20 = 20 concurrent workers
+   • -z 10s = run for 10 seconds
+   b) ApacheBench
+   ab -n 500 -c 50 http://localhost:8080/proxy/user/5
+   • 500 total requests, 50 concurrent (often enough to exceed your 10 QPS).
+   c) Pure bash + curl (parallel)
+   seq 200 | xargs -n1 -P20 -I{} curl -s -o /dev/null -w "%{http_code}\n" \
+   "http://localhost:8080/proxy/user/5"
+   • 20 parallel curls, 200 total requests.
+
+
+
+
+                END of experiment to customize the WebClient -  22. Custom Request Throttling (Rate Limiting)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 23. Custom Connection Pool Settings
     By default, Reactor Netty’s connection pool size might be too small for high concurrency. You can tune max connections, pending

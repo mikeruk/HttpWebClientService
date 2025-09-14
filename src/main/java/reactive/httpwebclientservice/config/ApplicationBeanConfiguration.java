@@ -8,10 +8,15 @@ import io.github.resilience4j.bulkhead.BulkheadConfig;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedRateLimiterMetrics;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
 import io.micrometer.common.KeyValue;
 import io.micrometer.common.KeyValues;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.binder.MeterBinder;
 import io.micrometer.core.instrument.config.MeterFilter;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.observation.ObservationRegistry;
@@ -328,7 +333,8 @@ public class ApplicationBeanConfiguration {
                                                           ClientRequestObservationConvention webClientObservationConvention,
                                                           CircuitBreakerRegistry circuitBreakerRegistry,
                                                           BulkheadRegistry bulkheadRegistry,
-                                                          InMemoryCookieJar cookieJar )
+                                                          InMemoryCookieJar cookieJar,
+                                                          RateLimiterRegistry rateLimiterRegistry)
     {
 
         // Per-client, Spring-aware mappers:
@@ -399,6 +405,20 @@ public class ApplicationBeanConfiguration {
         // NEW (Task 18): cookie filter (set logCookies=true if you want to see its debug lines)
         var cookieJarFilter      = new CookieFilter(cookieJar, true);
 
+        // ───────────────────────────────────────────────────────────────
+        // NEW: Rate limiter filter.
+        // Key strategy options:
+        //  - GLOBAL single limiter: req -> "global"
+        //  - Per serviceId (good default): req -> props.getServiceId()
+        //  - Per route: req -> req.method().name() + " " + req.url().getPath()
+        //  - Per tenant from header: req -> "tenant:" + Optional.ofNullable(req.headers().getFirst("X-Tenant")).orElse("anon")
+        // Pick one:
+        // ───────────────────────────────────────────────────────────────
+        var rateLimitFilter = new RateLimitingFilter(
+                rateLimiterRegistry,
+                req -> props.getServiceId() // ← per-backend-service limiter (recommended here)
+        );
+
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
@@ -416,6 +436,9 @@ public class ApplicationBeanConfiguration {
                     c.defaultCodecs().maxInMemorySize(256 * 1024); // 256 KB
                 })
                 .filters(list -> {
+                    // ───────────────── ORDER MATTERS ─────────────────
+                    // Put RATE LIMITING OUTERMOST → it gates everything (retry, CB, etc.)
+                    list.add(0, rateLimitFilter);  // <-- NEW (outermost)
                     // Put logging fairly outer so you see what's retried, but AFTER request-mutation,
                     // so headers (auth/correlation) appear in logs.
                     list.add(loggingFilter);
@@ -485,5 +508,36 @@ public class ApplicationBeanConfiguration {
         return new reactive.httpwebclientservice.cookies.StickyCookieStore();
     }
 
+
+    // ───────────────────────────────────────────────────────────────
+    // NEW: Central RateLimiter registry (code-based config, no YAML).
+    //   Example policy: ≤10 QPS with burst 20, and wait up to 100 ms
+    //   to acquire a permit (otherwise fail fast).
+    //   Tune these numbers as you need, or externalize to properties.
+    // ───────────────────────────────────────────────────────────────
+    @Bean
+    RateLimiterRegistry rateLimiterRegistry() {
+        RateLimiterConfig cfg = RateLimiterConfig.custom()
+                .limitRefreshPeriod(java.time.Duration.ofSeconds(1))  // "per second"
+                .limitForPeriod(10)                                   // 10 permits added each second
+                .timeoutDuration(java.time.Duration.ofMillis(100))    // wait up to 100ms for a token
+                .build();
+        return RateLimiterRegistry.of(cfg);
+    }
+
+    @Bean
+    MeterBinder rateLimiterMetricsBinder(RateLimiterRegistry rlRegistry) {
+        // This publishes:
+        //  - resilience4j.ratelimiter.calls
+        //  - resilience4j.ratelimiter.available.permissions
+        //  - resilience4j.ratelimiter.waiting.threads
+        return TaggedRateLimiterMetrics.ofRateLimiterRegistry(rlRegistry);
+    }
+
+    // Eagerly create a named limiter so meters can be bound immediately
+    @Bean
+    RateLimiter backendServiceRateLimiter(RateLimiterRegistry registry, DserviceClientProperties props) {
+        return registry.rateLimiter(props.getServiceId()); // e.g. "backend-service"
+    }
 
 }

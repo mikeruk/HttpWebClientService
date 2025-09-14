@@ -46,6 +46,9 @@ dependencies {
     // (optional) metrics auto-binding if you want:
     implementation 'io.github.resilience4j:resilience4j-micrometer:2.2.0'
 
+    // For the purpose of 22. Custom Request Throttling (Rate Limiting)
+    implementation 'io.github.resilience4j:resilience4j-ratelimiter:2.2.0'
+
 }
 
 tasks.named('test') {
