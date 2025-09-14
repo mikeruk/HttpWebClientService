@@ -6417,47 +6417,123 @@ That’s it—you now have explicit, per-client connection pools tuned for your 
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+                START of experiment to customize the WebClient -  24. Custom Codec for XML, YAML, or Protobuf
 
 
 
 24. Custom Codec for XML, YAML, or Protobuf
     Maybe you’re talking to a legacy service that uses XML or a partner that uses Protobuf. You need to register an additional codec
     so RestClient can automatically marshal/unmarshal.
+
+
+How this plays with HTTP & Spring
+• The server picks what it sends via Content-Type.
+• The client asks for what it wants with Accept.
+• Your WebClient needs the right codec to (de)serialize that media type.
+Spring WebFlux already has built-ins for XML (JAXB/Jackson XML) and Protobuf. YAML isn’t built in—you can add it via Jackson’s YAML dataformat with a tiny custom codec.
+
+What these formats are (in HTTP terms)
+• XML
+Text, tag-based (think <user><id>1</id></user>). Old but very common in legacy/enterprise APIs (SOAP/REST).
+MIME types: application/xml, text/xml.
+Pros: mature tooling, schemas (XSD), validation.
+Cons: verbose, heavier than JSON.
+• YAML
+Text, indentation-based (a superset of JSON). Humans love editing it; it’s huge in config files (Kubernetes, CI). Rare as an API wire format, but possible.
+MIME types: application/yaml, application/x-yaml.
+Pros: human-friendly.
+Cons: easy to misindent, not universally supported by API clients/servers.
+• Protocol Buffers (Protobuf)
+Binary serialization from Google. You define a .proto schema, generate classes, then send compact bytes. Often used with gRPC (HTTP/2) but can be used over plain HTTP.
+MIME types: application/x-protobuf, application/protobuf.
+Pros: tiny payloads, fast, strict schema.
+Cons: not human-readable; requires codegen and agreed schemas.
+
+
+Here’s everything you need to wire all three codecs (XML, Protobuf, YAML) into your existing 
+WebClient without touching the rest of your stack.
+
+1) Add dependencies
+```yaml
+dependencies {
+  // XML
+  implementation 'org.glassfish.jaxb:jaxb-runtime'   // XML (JAXB)
+  // YAML
+  implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml'
+  // Protobuf runtime (for generated message classes)
+  implementation 'com.google.protobuf:protobuf-java'  // Protobuf
+
+}
+
+```
+
+2) Register codecs in your existing builder
+Add the XML, Protobuf and Yaml coders/decoders to the codecs:
+```java
+
+.codecs(c -> {
+    // JSON (keep)
+    c.defaultCodecs().jackson2JsonEncoder(encoder);
+    c.defaultCodecs().jackson2JsonDecoder(decoder);
+
+    // XML via JAXB (works on all Spring 6 / Boot 3 versions)
+    c.defaultCodecs().jaxb2Encoder(new org.springframework.http.codec.xml.Jaxb2XmlEncoder());
+    c.defaultCodecs().jaxb2Decoder(new org.springframework.http.codec.xml.Jaxb2XmlDecoder());
+
+    // Protobuf
+    c.customCodecs().encoder(new org.springframework.http.codec.protobuf.ProtobufEncoder());
+    c.customCodecs().decoder(new org.springframework.http.codec.protobuf.ProtobufDecoder());
+
+    // YAML via Jackson YAML
+    var yamlMapper = new com.fasterxml.jackson.dataformat.yaml.YAMLMapper();
+    var yamlTypes = new org.springframework.util.MimeType[] {
+        org.springframework.util.MimeType.valueOf("application/x-yaml"),
+        org.springframework.util.MimeType.valueOf("application/yaml"),
+        org.springframework.util.MimeType.valueOf("text/yaml"),
+        org.springframework.util.MimeType.valueOf("application/*+yaml")
+    };
+    c.customCodecs().encoder(new org.springframework.http.codec.json.Jackson2JsonEncoder(yamlMapper, yamlTypes));
+    c.customCodecs().decoder(new org.springframework.http.codec.json.Jackson2JsonDecoder(yamlMapper, yamlTypes));
+
+    c.defaultCodecs().maxInMemorySize(256 * 1024);
+})
+
+```
+Note: JAXB requires your DTOs to have JAXB annotations (e.g., @XmlRootElement, @XmlElement) to serialize/deserialize.
+
+If you prefer Jackson XML
+
+Upgrade to a Spring Framework / Spring Boot version that includes org.springframework.http.codec.xml.Jackson2XmlEncoder/Decoder (e.g., recent Boot 3.3.x), and add:
+```yml
+implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-xml'
+
+```
+That’s it — your WebClient can now automatically (de)serialize XML, YAML, and Protobuf whenever a server responds with those Content-Types or when you set Accept/Content-Type accordingly.
+
+
+
+
+                END of experiment to customize the WebClient -  24. Custom Codec for XML, YAML, or Protobuf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 25. Conditional Circuit Breaker Per Endpoint
     Perhaps you trust /user/{id} to be quick, but /user-with-data/{id} is slow (joins multiple tables). You might want a tighter

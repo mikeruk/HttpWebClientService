@@ -430,6 +430,9 @@ public class ApplicationBeanConfiguration {
                 req -> props.getServiceId() // ← per-backend-service limiter (recommended here)
         );
 
+
+
+
         // Build the LB-aware WebClient.Builder with custom per-client codecs
         return WebClient.builder()
                 .clientConnector(connector)
@@ -439,6 +442,32 @@ public class ApplicationBeanConfiguration {
                 .codecs(c -> {
                     c.defaultCodecs().jackson2JsonEncoder(encoder);
                     c.defaultCodecs().jackson2JsonDecoder(decoder);
+
+
+                    // XML via JAXB (works on all Spring 6 / Boot 3 versions)
+                    c.defaultCodecs().jaxb2Encoder(new org.springframework.http.codec.xml.Jaxb2XmlEncoder());
+                    c.defaultCodecs().jaxb2Decoder(new org.springframework.http.codec.xml.Jaxb2XmlDecoder());
+
+                    // Protobuf
+                    c.customCodecs().encoder(new org.springframework.http.codec.protobuf.ProtobufEncoder());
+                    c.customCodecs().decoder(new org.springframework.http.codec.protobuf.ProtobufDecoder());
+
+                    // YAML via Jackson YAML
+                    var yamlMapper = new com.fasterxml.jackson.dataformat.yaml.YAMLMapper();
+                    var yamlTypes = new org.springframework.util.MimeType[] {
+                            org.springframework.util.MimeType.valueOf("application/x-yaml"),
+                            org.springframework.util.MimeType.valueOf("application/yaml"),
+                            org.springframework.util.MimeType.valueOf("text/yaml"),
+                            org.springframework.util.MimeType.valueOf("application/*+yaml")
+                    };
+                    c.customCodecs().encoder(new org.springframework.http.codec.json.Jackson2JsonEncoder(yamlMapper, yamlTypes));
+                    c.customCodecs().decoder(new org.springframework.http.codec.json.Jackson2JsonDecoder(yamlMapper, yamlTypes));
+
+
+
+
+
+
                     // (optional) increase if you parse large payloads
                     // ─────────────────────────────────────────────────────────────
                     // NEW: keep codec buffering small so uploads don’t blow memory.

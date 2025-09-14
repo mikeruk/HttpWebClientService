@@ -49,6 +49,15 @@ dependencies {
     // For the purpose of 22. Custom Request Throttling (Rate Limiting)
     implementation 'io.github.resilience4j:resilience4j-ratelimiter:2.2.0'
 
+    // For the purpose of 24. Custom Codec for XML, YAML, or Protobuf
+    // XML
+    implementation 'org.glassfish.jaxb:jaxb-runtime'   // XML (JAXB)
+    // YAML
+    implementation 'com.fasterxml.jackson.dataformat:jackson-dataformat-yaml'
+    // Protobuf runtime (for generated message classes)
+    implementation 'com.google.protobuf:protobuf-java'  // Protobuf
+
+
 }
 
 tasks.named('test') {
