@@ -6798,19 +6798,23 @@ And these filter break it. I cannot have two filtern. But even if I remove one, 
 
 
 
+                START of experiment to customize the WebClient -  28. Implementing a Custom “Fallback to Cache” on 404
 
 
 
-
-
-
-
-
-
+Its nice to know there is such feature. At later stage could be implemented.
 
 28. Implementing a Custom “Fallback to Cache” on 404
     If your user data is sometimes stale, you want to first check a local cache. If the remote call returns 404, then you serve from
     the cache. Otherwise, you return the remote data and repopulate cache.
+
+
+
+                END of experiment to customize the WebClient -  28. Implementing a Custom “Fallback to Cache” on 404
+
+
+
+
 
 29. Request Batching (Combining Multiple Calls into One)
     If you have to fetch user A, B, and C in quick succession, it’s often more efficient to call /api/v1/users?ids=A,B,C once rather
