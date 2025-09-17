@@ -6850,20 +6850,32 @@ Why it’s nice:
 
 
 
+                START of experiment to customize the WebClient -  30. Custom Authorization Flow (OAuth2 Client Credentials)
+
+
+
 
 30. Custom Authorization Flow (OAuth2 Client Credentials)
     If your backend is secured by OAuth2, you need to fetch an access token from an auth server (e.g. Keycloak) and attach it as
     Authorization: Bearer <token> on every request. The token needs automatic refresh before expiry.
 
 
+To be able to fully test this functionality, you will need:
+• An OAuth2 Authorization Server (e.g., Keycloak) that issues tokens via the client credentials grant.
+• A Resource Server (your backend) configured to require and validate those tokens.
+However:
+• To implement the client side in your HttpWebClientService (fetch token, cache it, auto-refresh, add Authorization: Bearer ...), you don’t strictly need the backend secured yet. You do need some token endpoint to call (real Keycloak or a stub like WireMock).
+• If your backend isn’t enforcing auth, your requests will still succeed—with or without a token—so you won’t see 401→token→200 behavior.
+Practical options:
+1. Realistic: run Keycloak in Docker, create a confidential client (client_credentials), point the client to token_uri, and secure your backend with Spring’s resource server.
+2. Lightweight test: stub /oauth/token with WireMock returning a JSON token (with small expires_in), and verify your client fetches/caches/refreshes it.
+3. Placeholder: use a static fake token just to wire the filter—useful for plumbing, not for real auth.
 
 
 
 
 
-
-
-
+                ENDof experiment to customize the WebClient -  30. Custom Authorization Flow (OAuth2 Client Credentials)
 
 
 
