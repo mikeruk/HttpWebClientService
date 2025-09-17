@@ -6816,9 +6816,40 @@ Its nice to know there is such feature. At later stage could be implemented.
 
 
 
+
+
+                START of experiment to customize the WebClient -  29. Request Batching (Combining Multiple Calls into One)
+
+
+
+
 29. Request Batching (Combining Multiple Calls into One)
     If you have to fetch user A, B, and C in quick succession, it’s often more efficient to call /api/v1/users?ids=A,B,C once rather
     than 3 separate /user/{id} calls. You can implement a small “batcher” layer on top of your RestClient.
+
+Here is just a short explanation of what it does and why:
+
+Think of it like a shuttle bus instead of taxis.
+• Your code keeps asking: “get me user A”, “get me user B”, “get me user C”.
+• The batcher waits a tiny moment (e.g., up to 10 ms) to see who else shows up, deduplicates IDs, and then sends one request to the backend: /users?ids=A,B,C.
+• When the response comes back, it hands each passenger their result (A to the A-caller, B to the B-caller, etc.).
+• If someone’s user isn’t returned, that caller just gets a “not found” error; others still succeed.
+• There’s a cap (e.g., 50 IDs) and a max wait so nobody sits forever—whichever happens first triggers the send.
+Why it’s nice:
+• Fewer backend calls, lower latency under load, easier on rate limits.
+• No API change for callers—they still call getUser(id).
+• Tiny, controlled delay per call for a big reduction in chattiness.
+
+
+
+
+                END of experiment to customize the WebClient -  29. Request Batching (Combining Multiple Calls into One)
+
+
+
+
+
+
 
 30. Custom Authorization Flow (OAuth2 Client Credentials)
     If your backend is secured by OAuth2, you need to fetch an access token from an auth server (e.g. Keycloak) and attach it as
